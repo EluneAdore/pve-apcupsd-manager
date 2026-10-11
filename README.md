@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/EluneAdore/pve-apcupsd-manager/main
 pve-ups
 ```
 
-菜单顶部显示 UPS 供电、电量、续航和关机倒计时，等待选择时约每 2 秒刷新。
+菜单顶部显示 UPS 供电、电量、续航和关机倒计时。等待输入时页面保持静止，进入页面或操作后更新；空回车可手动刷新。
 
 ```text
 1. 查看 UPS 详细状态

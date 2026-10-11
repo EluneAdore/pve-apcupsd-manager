@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 菜单空闲时刷新；一旦输入字符，等用户完成输入后再重绘。
+# 等待输入时保持页面静止；进入页面或完成操作后更新显示。
 
 ups_status_chinese() {
     local state token result=''
@@ -132,19 +132,9 @@ autostart_chinese() {
 menu_clear() { [[ ${TERM:-dumb} == dumb ]] || printf '\033[H\033[2J'; }
 
 menu_choice() {
-    local first tail result
     MENU_CHOICE=''
     printf '\n请选择（输入数字并回车）：'
-    if IFS= read -r -n 1 -t 2 first; then
-        [[ $first != $'\004' ]] || return 1
-        if [[ -n $first ]]; then
-            IFS= read -r tail || return 1
-            MENU_CHOICE=$first$tail
-        fi
-        return 0
-    else result=$?; fi
-    # 超时返回循环刷新，终端关闭则退出。
-    (( result > 128 )) && [[ -t 0 ]]
+    IFS= read -r MENU_CHOICE
 }
 
 menu_pause() { printf '\n按回车返回…'; IFS= read -r _ || :; }

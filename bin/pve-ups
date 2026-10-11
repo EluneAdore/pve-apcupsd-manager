@@ -12,7 +12,7 @@ show_help() {
     cat <<'HELP'
 PVE UPS 管理（本机 APC USB / apcupsd）
   pve-ups                         打开中文菜单
-  pve-ups status                  查看实时状态与关机计时
+  pve-ups status                  查看当前状态与关机计时
   pve-ups install                 安装或修复，保留已有参数
   pve-ups set 参数 值              校验、保存并应用单项参数
   pve-ups upgrade                 升级 apcupsd
