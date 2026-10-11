@@ -45,7 +45,7 @@ render_countdown() {
         if [[ $limit == 0 ]]; then
             msg '等待时间条件已禁用；电池保护仍有效'
         elif seconds=$(countdown_seconds); then
-            printf '%02d 分 %02d 秒（估算；电量 / 续航不足可提前关机）\n' "$((seconds / 60))" "$((seconds % 60))"
+            printf '%02d min %02d s（估算；电量 / 续航不足可提前关机）\n' "$((seconds / 60))" "$((seconds % 60))"
         else
             msg '无法确认'
         fi
@@ -66,10 +66,10 @@ render_status() {
     msg "apcupsd：$version    监控：$monitoring"
     msg "UPS 型号：$model"
     msg "供电状态：$(ups_status_chinese)"
-    msg "电池电量：$(ups_measurement BCHARGE '%')    剩余续航：$(ups_measurement TIMELEFT '分钟')"
+    msg "电池电量：$(ups_measurement BCHARGE '%')    剩余续航：$(ups_measurement TIMELEFT 'min')"
     msg "负载比例：$(ups_measurement LOADPCT '%')"
     if [[ $UPS_QUERY_OK == 1 && " $(ups_value STATUS) " == *' ONBATT '* && $(ups_value STATUS) != *COMMLOST* ]]; then
-        msg "本次停电时长：$(ups_measurement TONBATT '秒')"
+        msg "本次停电时长：$(ups_measurement TONBATT 's')"
     fi
     msg "关机倒计时：$(render_countdown)"
     [[ $monitoring == 运行中 ]] || msg '监控未运行，当前没有自动关机保障。'
@@ -93,9 +93,9 @@ render_details() {
         if [[ -z $value ]]; then value='未提供 / 无法确认'
         else
             case $key in
-                LINEV|OUTPUTV|BATTV|NOMBATTV) value=$(ups_measurement "$key" '伏') ;;
-                LINEFREQ) value=$(ups_measurement "$key" '赫兹') ;;
-                ITEMP) value=$(ups_measurement "$key" '℃') ;;
+                LINEV|OUTPUTV|BATTV|NOMBATTV) value=$(ups_measurement "$key" 'V') ;;
+                LINEFREQ) value=$(ups_measurement "$key" 'Hz') ;;
+                ITEMP) value=$(ups_measurement "$key" '°C') ;;
             esac
         fi
         msg "$label：$value"
@@ -114,10 +114,10 @@ current_setting() {
     case $config_key in
         TIMEOUT)
             if [[ $value == 0 ]]; then printf '禁用时间条件（%s）\n' "$origin"
-            elif [[ $value =~ ^[0-9]+$ ]]; then printf '%s 分 %s 秒（%s）\n' "$((10#$value/60))" "$((10#$value%60))" "$origin"
+            elif [[ $value =~ ^[0-9]+$ ]]; then printf '%s min %s s（%s）\n' "$((10#$value/60))" "$((10#$value%60))" "$origin"
             else msg '配置无效'; fi ;;
         BATTERYLEVEL) printf '%s %%（%s）\n' "$value" "$origin" ;;
-        MINUTES) printf '%s 分钟（%s）\n' "$value" "$origin" ;;
+        MINUTES) printf '%s min（%s）\n' "$value" "$origin" ;;
     esac
 }
 
