@@ -369,6 +369,13 @@ lifecycle_configure_event_notifications() {
 case "${1:-}" in
     onbattery|offbattery|commfailure|commok) WALL=/bin/true ;;
 esac
+case "${1:-}" in
+    onbattery|offbattery)
+        if [ -x /usr/local/sbin/pve-ups ]; then
+            /usr/local/sbin/pve-ups history-record "${1}" >/dev/null 2>&1 &
+        fi
+        ;;
+esac
 # END pve-ups: event-notifications
 EOF
     if ! /bin/sh -n "$temporary" || ! guard_mains || ! mv -f -- "$temporary" "$file"; then

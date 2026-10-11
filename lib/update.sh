@@ -29,7 +29,7 @@ bootstrap_tool_update() (
     guard_mains || return 1
     APP_ROOT=$BOOTSTRAP_BUNDLE
     # 当前操作已持有管理锁，加载新版模块后在同一操作内更新，避免重复取锁。
-    for module in common config lifecycle update; do
+    for module in common config lifecycle history update; do
         # shellcheck source=/dev/null
         source "$APP_ROOT/lib/$module.sh" || return 1
     done

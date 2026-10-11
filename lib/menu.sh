@@ -65,6 +65,7 @@ render_status() {
     monitoring='已停止'
     service_active && monitoring='运行中'
     read_ups_snapshot || :
+    history_sync 2>/dev/null || :
     model=$(ups_value MODEL)
     ups_has_value MODEL || model=''
     msg "──────── PVE UPS 管理 $APP_VERSION ────────"
@@ -105,8 +106,14 @@ render_details() {
             LINEFREQ) value=$(ups_measurement "$key" 'Hz') || value='' ;;
             ITEMP) value=$(ups_measurement "$key" '°C') || value='' ;;
             LASTXFER)
-                if [[ $value == 'No transfers since turnon' ]]; then
-                    label='上次切换原因'; value='开机以来没有供电切换记录'
+                if [[ -n $value ]]; then
+                    local translated
+                    translated=$(history_translate_reason "$value")
+                    if [[ $value == 'No transfers since turnon' ]]; then
+                        label='上次切换原因'; value='开机以来没有供电切换记录'
+                    elif [[ $translated != "$value" ]]; then
+                        label='上次切换原因'; value="$translated（$value）"
+                    fi
                 fi ;;
         esac
         msg "$label：$value"
@@ -263,6 +270,34 @@ details_menu() {
     done
 }
 
+render_history_menu() {
+    render_history 15
+    printf '\n1. 刷新记录\n2. 清空历史记录\n0. 返回\n'
+}
+
+history_menu() {
+    local answer
+    while :; do
+        menu_choice render_history_menu || return 0
+        case $MENU_CHOICE in
+            '') continue ;;
+            0) return ;;
+            1) history_sync; continue ;;
+            2)
+                printf '\n确认清空所有停电与供电历史记录？输入“清空”继续：'
+                IFS= read -r answer || return
+                if [[ $answer == 清空 ]]; then
+                    history_clear
+                    msg '历史记录已清空。'
+                else
+                    msg '已取消清空。'
+                fi
+                menu_pause ;;
+            *) msg '请输入菜单中的数字。'; menu_pause ;;
+        esac
+    done
+}
+
 service_menu() {
     local choice
     printf '\n1. 启动监控\n2. 停止监控\n3. 重启监控\n0. 返回\n请选择：'
@@ -323,7 +358,7 @@ render_diagnosis() {
 
 render_main_menu() {
     render_status
-    printf '\n1. 查看 UPS 详细状态\n2. 修改关机设置\n3. 安装 / 修复 apcupsd\n4. 升级 apcupsd\n5. 管理监控服务\n6. 查看事件记录与诊断\n7. 更新管理工具\n8. 卸载并恢复原状态\n0. 退出\n'
+    printf '\n1. 查看 UPS 详细状态\n2. 查看停电与供电记录\n3. 修改关机设置\n4. 安装 / 修复 apcupsd\n5. 升级 apcupsd\n6. 管理监控服务\n7. 查看事件记录与诊断\n8. 更新管理工具\n9. 卸载并恢复原状态\n0. 退出\n'
 }
 
 main_menu() {
@@ -339,13 +374,14 @@ main_menu() {
         case $MENU_CHOICE in
             '') continue ;; 0) return ;;
             1) details_menu; continue ;;
-            2) settings_menu; continue ;;
-            3) mutate lifecycle_install ;;
-            4) mutate lifecycle_upgrade ;;
-            5) service_menu ;;
-            6) render_diagnosis ;;
-            7) mutate lifecycle_tool_update ;;
-            8) if confirm_uninstall && mutate lifecycle_uninstall; then return; fi ;;
+            2) history_menu; continue ;;
+            3) settings_menu; continue ;;
+            4) mutate lifecycle_install ;;
+            5) mutate lifecycle_upgrade ;;
+            6) service_menu ;;
+            7) render_diagnosis ;;
+            8) mutate lifecycle_tool_update ;;
+            9) if confirm_uninstall && mutate lifecycle_uninstall; then return; fi ;;
             *) msg '请输入菜单中的数字。' ;;
         esac
         menu_pause

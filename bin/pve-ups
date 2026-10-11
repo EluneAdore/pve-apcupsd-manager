@@ -3,7 +3,7 @@
 set -uo pipefail
 entry=$(readlink -f -- "${BASH_SOURCE[0]}") || exit 1
 APP_ROOT=$(cd -- "$(dirname -- "$entry")/.." && pwd) || exit 1
-for module in common config lifecycle menu update; do
+for module in common config lifecycle history menu update; do
     # shellcheck source=/dev/null
     source "$APP_ROOT/lib/$module.sh" || exit 1
 done
@@ -13,6 +13,7 @@ show_help() {
 PVE UPS 管理（本机 APC USB / apcupsd）
   pve-ups                         打开中文菜单
   pve-ups status                  查看当前状态与关机计时
+  pve-ups history                 查看停电与供电历史记录
   pve-ups install                 安装或修复，保留已有参数
   pve-ups set 参数 值              校验、保存并应用单项参数
   pve-ups upgrade                 升级 apcupsd
@@ -35,6 +36,8 @@ main() {
     case $command in
         menu) (( $# == 0 )) || return 2; require_root && require_pve && main_menu ;;
         status) (( $# == 0 )) || return 2; render_status ;;
+        history) (( $# == 0 )) || return 2; render_history ;;
+        history-record) [[ $# == 1 ]] || return 2; history_record_event "$1" ;;
         help|--help|-h) show_help ;;
         --version) msg "$APP_VERSION" ;;
         install)
