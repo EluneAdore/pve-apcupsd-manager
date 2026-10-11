@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# 中文终端入口；只有维护操作取得互斥锁。
+set -uo pipefail
+entry=$(readlink -f -- "${BASH_SOURCE[0]}") || exit 1
+APP_ROOT=$(cd -- "$(dirname -- "$entry")/.." && pwd) || exit 1
+for module in common config lifecycle menu update; do
+    # shellcheck source=/dev/null
+    source "$APP_ROOT/lib/$module.sh" || exit 1
+done
+
+show_help() {
+    cat <<'HELP'
+PVE UPS 管理（本机 APC USB / apcupsd）
+  pve-ups                         打开中文菜单
+  pve-ups status                  查看实时状态与关机计时
+  pve-ups install [--config 文件]  安装或修复，保留已有参数
+  pve-ups set 参数 值              校验、保存并应用单项参数
+  pve-ups upgrade                 升级 apcupsd
+  pve-ups service 操作             start/stop/restart/enable/disable
+  pve-ups export 文件              备份配置（目标必须不存在）
+  pve-ups import 文件              恢复配置并应用
+  pve-ups diagnose                查看诊断与原始日志
+  pve-ups tool-update 引用         更新管理工具（标签或完整提交号）
+  pve-ups uninstall [--yes]        本地卸载，恢复首次安装前状态
+  pve-ups help                    查看帮助
+
+常用参数：TIMEOUT（秒，默认 1800，0 禁用）、BATTERYLEVEL（%）、MINUTES（分钟）。
+停电或运行中的通信状态未知时，阻止会影响关机计时的维护操作。
+HELP
+}
+
+mutate() { require_root && require_pve && state_validate_paths && with_lock "$@"; }
+
+main() {
+    local command=${1:-menu} imported=''
+    (( $# == 0 )) || shift
+    case $command in
+        menu) (( $# == 0 )) || return 2; require_root && require_pve && main_menu ;;
+        status) (( $# == 0 )) || return 2; render_status ;;
+        help|--help|-h) show_help ;;
+        --version) msg "$APP_VERSION" ;;
+        install)
+            if (( $# )); then
+                [[ $# == 2 && $1 == --config ]] || { err '用法：pve-ups install [--config 文件]'; return 2; }
+                imported=$2
+            fi
+            mutate lifecycle_install "$imported" ;;
+        set) [[ $# == 2 ]] || { err '用法：pve-ups set 参数 值'; return 2; }; mutate config_change "$1" "$2" ;;
+        upgrade) (( $# == 0 )) || return 2; mutate lifecycle_upgrade ;;
+        service) [[ $# == 1 ]] || return 2; mutate service_action "$1" ;;
+        export) [[ $# == 1 ]] || return 2; mutate config_export "$1" ;;
+        import) [[ $# == 1 ]] || return 2; mutate config_import "$1" ;;
+        diagnose) (( $# == 0 )) || return 2; render_diagnosis ;;
+        tool-update) [[ $# == 1 ]] || { err '请指定标签或完整提交号。'; return 2; }; mutate lifecycle_tool_update "$1" ;;
+        tool-install) (( $# == 0 )) || return 2; mutate tool_install_bundle ;;
+        uninstall)
+            [[ $# == 0 || ( $# == 1 && $1 == --yes ) ]] || return 2
+            if [[ ${1:-} != --yes ]]; then confirm_uninstall || return 1; fi
+            mutate lifecycle_uninstall ;;
+        *) err "未知命令：$command。请运行 pve-ups help。"; return 2 ;;
+    esac
+}
+main "$@"

@@ -1,0 +1,28 @@
+name: 脚本检查与隔离测试
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@v4
+      - name: 安装静态检查工具
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: 检查 Bash 语法和 ShellCheck
+        shell: bash
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh' 'bin/pve-ups' 'pve-ups')
+          for script in "${scripts[@]}"; do
+            bash -n "$script"
+          done
+          shellcheck -x "${scripts[@]}"
+      - name: 运行隔离测试
+        run: bash tests/run.sh
