@@ -59,23 +59,26 @@ render_countdown() {
 }
 
 render_status() {
-    local version monitoring model battery runtime load elapsed readings=''
+    local version monitoring model battery runtime load elapsed
     version=$(package_version) || version=''
     version=${version:-未安装}
     monitoring='已停止'
     service_active && monitoring='运行中'
     read_ups_snapshot || :
     model=$(ups_value MODEL)
+    ups_has_value MODEL || model=''
     msg "──────── PVE UPS 管理 $APP_VERSION ────────"
     msg "apcupsd：$version    监控：$monitoring"
-    if ups_has_value MODEL; then msg "UPS 型号：$model"; fi
+    msg "UPS 型号：$model"
     msg "供电状态：$(ups_status_chinese)"
-    if battery=$(ups_measurement BCHARGE '%'); then readings="电池电量：$battery"; fi
-    if runtime=$(ups_measurement TIMELEFT 'min'); then readings+="${readings:+    }剩余续航：$runtime"; fi
-    [[ -z $readings ]] || msg "$readings"
-    if load=$(ups_measurement LOADPCT '%'); then msg "负载比例：$load"; fi
+    battery=$(ups_measurement BCHARGE '%') || battery=''
+    runtime=$(ups_measurement TIMELEFT 'min') || runtime=''
+    load=$(ups_measurement LOADPCT '%') || load=''
+    msg "电池电量：$battery    剩余续航：$runtime"
+    msg "负载比例：$load"
     if [[ $UPS_QUERY_OK == 1 && " $(ups_value STATUS) " == *' ONBATT '* && $(ups_value STATUS) != *COMMLOST* ]]; then
-        if elapsed=$(ups_measurement TONBATT 's'); then msg "本次停电时长：$elapsed"; fi
+        elapsed=$(ups_measurement TONBATT 's') || elapsed=''
+        msg "本次停电时长：$elapsed"
     fi
     msg "关机倒计时：$(render_countdown)"
     [[ $monitoring == 运行中 ]] || msg '监控未运行，当前没有自动关机保障。'
@@ -95,12 +98,12 @@ render_details() {
             BATTDATE) label='设备记录的电池日期' ;; LASTXFER) label='上次切换原因（设备原文）' ;;
             XONBATT) label='上次转入电池时间' ;; XOFFBATT) label='上次恢复市电时间' ;;
         esac
-        ups_has_value "$key" || continue
-        value=$(ups_value "$key")
+        value=''
+        if ups_has_value "$key"; then value=$(ups_value "$key"); fi
         case $key in
-            LINEV|OUTPUTV|BATTV|NOMBATTV) value=$(ups_measurement "$key" 'V') || continue ;;
-            LINEFREQ) value=$(ups_measurement "$key" 'Hz') || continue ;;
-            ITEMP) value=$(ups_measurement "$key" '°C') || continue ;;
+            LINEV|OUTPUTV|BATTV|NOMBATTV) value=$(ups_measurement "$key" 'V') || value='' ;;
+            LINEFREQ) value=$(ups_measurement "$key" 'Hz') || value='' ;;
+            ITEMP) value=$(ups_measurement "$key" '°C') || value='' ;;
             LASTXFER)
                 if [[ $value == 'No transfers since turnon' ]]; then
                     label='上次切换原因'; value='开机以来没有供电切换记录'
