@@ -453,7 +453,11 @@ lifecycle_install() (
     lifecycle_record_added_packages || return 1
     prepared=$LIFECYCLE_TX/prepared.conf
     prepare_config "$CONFIG_FILE" "$prepared" || return 1
-    if [[ $installed_before == no ]]; then config_set TIMEOUT 1800 "$prepared" || return 1; fi
+    if [[ $installed_before == no ]]; then
+        config_set TIMEOUT 1800 "$prepared" || return 1
+        config_set BATTERYLEVEL 50 "$prepared" || return 1
+        config_set MINUTES 30 "$prepared" || return 1
+    fi
     validate_config_file "$prepared" || return 1
     # 新装软件的初始默认配置不会在此之前启动。
     guard_mains || return 1

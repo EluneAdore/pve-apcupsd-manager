@@ -91,7 +91,7 @@ prepare_config() {
     for key in TIMEOUT BATTERYLEVEL MINUTES; do
         value=$(config_get "$key" "$output")
         if [[ -z $value ]]; then
-            case $key in TIMEOUT) value=1800 ;; BATTERYLEVEL) value=5 ;; MINUTES) value=3 ;; esac
+            case $key in TIMEOUT) value=1800 ;; BATTERYLEVEL) value=50 ;; MINUTES) value=30 ;; esac
             config_set "$key" "$value" "$output" || return 1
         fi
     done

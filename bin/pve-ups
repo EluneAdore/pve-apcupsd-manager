@@ -23,7 +23,7 @@ PVE UPS 管理（本机 APC USB / apcupsd）
   pve-ups uninstall [--yes]        本地卸载，恢复首次安装前状态
   pve-ups help                    查看帮助
 
-常用参数：TIMEOUT（秒，默认 1800，0 禁用）、BATTERYLEVEL（%）、MINUTES（分钟）。
+常用参数：TIMEOUT（秒，默认 1800，0 禁用）、BATTERYLEVEL（%，默认 50）、MINUTES（分钟，默认 30）。
 停电或运行中的通信状态未知时，阻止会影响关机计时的维护操作。
 HELP
 }
