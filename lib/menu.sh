@@ -270,25 +270,48 @@ details_menu() {
     done
 }
 
+history_menu_page_size() {
+    local rows=24 _columns size
+    IFS=' ' read -r rows _columns < <(stty size 2>/dev/null) || rows=24
+    [[ $rows =~ ^[0-9]+$ && $rows -ge 24 ]] || rows=24
+    size=$(((rows-15)/4))
+    (( size <= 8 )) || size=8
+    printf '%s\n' "$size"
+}
+
 render_history_menu() {
-    render_history 15
-    printf '\n1. 刷新记录\n2. 清空历史记录\n0. 返回\n'
+    render_history "$HISTORY_PAGE_SIZE" "$HISTORY_PAGE"
+    printf '\n1. 刷新记录\n2. 下一页\n3. 上一页\n4. 清空历史记录\n0. 返回\n'
 }
 
 history_menu() {
-    local answer
+    local answer HISTORY_PAGE=1 HISTORY_PAGE_SIZE pages
+    HISTORY_PAGE_SIZE=$(history_menu_page_size)
     while :; do
+        pages=$(history_page_count "$HISTORY_PAGE_SIZE")
+        (( HISTORY_PAGE <= pages )) || HISTORY_PAGE=$pages
         menu_choice render_history_menu || return 0
         case $MENU_CHOICE in
             '') continue ;;
             0) return ;;
-            1) history_sync; continue ;;
+            1) continue ;;
             2)
+                pages=$(history_page_count "$HISTORY_PAGE_SIZE")
+                (( HISTORY_PAGE >= pages )) || HISTORY_PAGE=$((HISTORY_PAGE+1))
+                continue ;;
+            3)
+                (( HISTORY_PAGE <= 1 )) || HISTORY_PAGE=$((HISTORY_PAGE-1))
+                continue ;;
+            4)
                 printf '\n确认清空所有停电与供电历史记录？输入“清空”继续：'
                 IFS= read -r answer || return
                 if [[ $answer == 清空 ]]; then
-                    history_clear
-                    msg '历史记录已清空。'
+                    if history_clear; then
+                        HISTORY_PAGE=1
+                        msg '历史记录已清空。'
+                    else
+                        err '历史记录未能清空，请查看安装状态或稍后重试。' || :
+                    fi
                 else
                     msg '已取消清空。'
                 fi

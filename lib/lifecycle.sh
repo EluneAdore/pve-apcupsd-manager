@@ -516,6 +516,21 @@ lifecycle_remove_owned_bundle() {
     fi
 }
 
+lifecycle_remove_owned_state() {
+    # 已打开的菜单和原生事件回调可能仍在同步历史；与它们共用锁再删除。
+    local lockfile=$HISTORY_FILE.lock
+    require_managed || return 1
+    [[ ! -L $lockfile && ( ! -e $lockfile || -f $lockfile ) ]] || {
+        err '历史记录锁不是普通文件，已保留卸载恢复记录。'; return 1;
+    }
+    (
+        flock -x 8 || return 1
+        # 等待锁期间可能已发生状态变化；删除前再次确认归属。
+        require_managed || return 1
+        rm -rf -- "$STATE_DIR"
+    ) 8>>"$lockfile"
+}
+
 lifecycle_uninstall() (
     local originally_present
     require_root && require_pve && state_validate_paths || return 1
@@ -552,7 +567,7 @@ lifecycle_uninstall() (
     LIFECYCLE_COMMITTED=yes
     # 生命周期 trap 还需要交易目录；先显式结束，再清除持久状态目录。
     lifecycle_transaction_finish 0 || return 1
-    rm -rf -- "$STATE_DIR" || return 1
+    lifecycle_remove_owned_state || return 1
     msg '卸载完成，已恢复首次部署前的配置及服务状态。'
 )
 
