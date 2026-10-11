@@ -14,14 +14,13 @@ tool_install_bundle() (
 )
 
 bootstrap_tool_update() (
-    local update_reference=$1
     # 引导脚本读取此变量，作为库加载。
     # shellcheck disable=SC2034
     PVE_UPS_BOOTSTRAP_SOURCE_ONLY=1
     # shellcheck source=bootstrap.sh
     source "$APP_ROOT/bootstrap.sh" || return 1
     trap '[[ -z ${BOOTSTRAP_TMP:-} ]] || rm -rf -- "$BOOTSTRAP_TMP"' EXIT
-    bootstrap_fetch "$update_reference" || return 1
+    bootstrap_fetch || return 1
     guard_mains || return 1
     APP_ROOT=$BOOTSTRAP_BUNDLE
     APP_VERSION=$(cat "$APP_ROOT/VERSION")

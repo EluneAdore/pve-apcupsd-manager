@@ -236,7 +236,6 @@ render_diagnosis() {
 }
 
 main_menu() {
-    local reference
     [[ -t 0 && -t 1 ]] || { err '交互菜单需要终端；请使用 pve-ups help 查看命令行操作。'; return 1; }
     while :; do
         menu_clear; render_status
@@ -250,9 +249,7 @@ main_menu() {
             4) mutate lifecycle_upgrade ;;
             5) service_menu ;;
             6) render_diagnosis ;;
-            7)
-                printf '请输入版本标签或完整提交号（留空取消）：'; IFS= read -r reference || return
-                [[ -z $reference ]] || mutate lifecycle_tool_update "$reference" ;;
+            7) mutate lifecycle_tool_update ;;
             8) if confirm_uninstall && mutate lifecycle_uninstall; then return; fi ;;
             *) msg '请输入菜单中的数字。' ;;
         esac

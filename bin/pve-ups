@@ -20,7 +20,7 @@ PVE UPS 管理（本机 APC USB / apcupsd）
   pve-ups export 文件              备份配置（目标必须不存在）
   pve-ups import 文件              恢复配置并应用
   pve-ups diagnose                查看诊断与原始日志
-  pve-ups tool-update 引用         更新管理工具（标签或完整提交号）
+  pve-ups tool-update              更新管理工具到最新版
   pve-ups uninstall [--yes]        本地卸载，恢复首次安装前状态
   pve-ups help                    查看帮助
 
@@ -51,7 +51,7 @@ main() {
         export) [[ $# == 1 ]] || return 2; mutate config_export "$1" ;;
         import) [[ $# == 1 ]] || return 2; mutate config_import "$1" ;;
         diagnose) (( $# == 0 )) || return 2; render_diagnosis ;;
-        tool-update) [[ $# == 1 ]] || { err '请指定标签或完整提交号。'; return 2; }; mutate lifecycle_tool_update "$1" ;;
+        tool-update) (( $# == 0 )) || { err '用法：pve-ups tool-update'; return 2; }; mutate lifecycle_tool_update ;;
         tool-install) (( $# == 0 )) || return 2; mutate tool_install_bundle ;;
         uninstall)
             [[ $# == 0 || ( $# == 1 && $1 == --yes ) ]] || return 2

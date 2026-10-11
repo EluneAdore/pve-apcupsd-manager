@@ -304,7 +304,7 @@ lifecycle_deploy_bundle() {
     staging=$(mktemp -d "${INSTALL_DIR}.new.XXXXXX") || return 1
     LIFECYCLE_BUNDLE_STAGING=$staging
     chmod 755 "$staging" || return 1
-    for item in VERSION bin lib share bootstrap.sh README.md docs LICENSE; do
+    for item in VERSION bin lib bootstrap.sh README.md; do
         if [[ -e $APP_ROOT/$item ]]; then cp -a -- "$APP_ROOT/$item" "$staging/$item" || { rm -rf -- "$staging"; return 1; }; fi
     done
     printf '%s\n' pve-ups-v1 > "$staging/.pve-ups-owned"
@@ -514,7 +514,7 @@ service_action() {
 lifecycle_tool_update() {
     require_root && require_pve && state_validate_paths && lifecycle_is_managed && guard_mains || return 1
     if declare -F bootstrap_tool_update >/dev/null; then
-        bootstrap_tool_update "${1:-}"
+        bootstrap_tool_update
     else
         err '当前安装包未提供管理工具更新入口，请使用发布版更新命令。'; return 1
     fi
