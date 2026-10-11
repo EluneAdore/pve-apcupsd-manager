@@ -138,10 +138,9 @@ with_lock() {
 }
 
 require_managed() {
-    [[ -f $STATE_DIR/.pve-ups-owned ]] &&
-        [[ $(cat "$STATE_DIR/.pve-ups-owned") == pve-ups-v1 ]] || {
-            err '尚未由本工具接管，请先选择“安装或修复监控软件”。'; return 1;
-        }
+    if [[ ! -f $STATE_DIR/.pve-ups-owned ]] || [[ $(cat "$STATE_DIR/.pve-ups-owned") != pve-ups-v1 ]]; then
+        err '尚未由本工具接管，请先选择“安装或修复监控软件”。'; return 1
+    fi
     if declare -F lifecycle_is_managed >/dev/null; then lifecycle_is_managed; fi
 }
 
