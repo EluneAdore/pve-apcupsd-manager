@@ -1,0 +1,1 @@
+# pve-apcupsd-manager
