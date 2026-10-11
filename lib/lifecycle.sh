@@ -381,14 +381,13 @@ lifecycle_show_upgrade_versions() {
 }
 
 lifecycle_install() (
-    local imported=${1:-} prepared installed_before=no
+    local prepared installed_before=no
     require_root && require_pve && state_validate_paths && guard_mains || return 1
     local legacy_command=${LEGACY_COMMAND_PATH:-${PVE_ROOT:-}/usr/local/bin/pve-ups}
     local legacy_timer=${LEGACY_TIMER_PATH:-${PVE_ROOT:-}/etc/systemd/system/pve-ups-hid.timer}
     if [[ -e $legacy_command || -L $legacy_command || -e $legacy_timer ]]; then
         err '检测到旧版电源监控工具，请先停用并卸载旧工具，避免重复关机监控。'; return 1
     fi
-    if [[ -n $imported ]]; then validate_config_file "$imported" || return 1; fi
     lifecycle_check_bundle_ownership || return 1
     lifecycle_create_baseline || return 1
     lifecycle_transaction_begin || return 1
@@ -400,8 +399,8 @@ lifecycle_install() (
     DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold apcupsd || return 1
     lifecycle_record_added_packages || return 1
     prepared=$LIFECYCLE_TX/prepared.conf
-    prepare_config "${imported:-$CONFIG_FILE}" "$prepared" || return 1
-    if [[ $installed_before == no && -z $imported ]]; then config_set TIMEOUT 1800 "$prepared" || return 1; fi
+    prepare_config "$CONFIG_FILE" "$prepared" || return 1
+    if [[ $installed_before == no ]]; then config_set TIMEOUT 1800 "$prepared" || return 1; fi
     validate_config_file "$prepared" || return 1
     # 新装软件的初始默认配置不会在此之前启动。
     guard_mains || return 1

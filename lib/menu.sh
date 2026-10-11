@@ -168,18 +168,6 @@ menu_edit() {
     mutate config_change "$key" "$converted"
 }
 
-backup_menu() {
-    local choice target
-    printf '\n1. 备份配置\n2. 恢复配置\n0. 返回\n请选择：'
-    IFS= read -r choice || return
-    case $choice in
-        1|2)
-            printf '请输入完整文件路径（留空返回）：'; IFS= read -r target || return
-            [[ -n $target ]] || return
-            if [[ $choice == 1 ]]; then mutate config_export "$target"; else mutate config_import "$target"; fi ;;
-    esac
-}
-
 settings_menu() {
     while :; do
         menu_clear
@@ -189,7 +177,6 @@ settings_menu() {
         msg "2. 电量低于多少时关机？       $(current_setting BATTERYLEVEL MBATTCHG)"
         msg "3. 剩余续航少于多久时关机？   $(current_setting MINUTES MINTIMEL)"
         msg "4. 开机自动监控 UPS           $(autostart_chinese)"
-        msg '5. 备份 / 恢复配置'
         msg '0. 返回'
         menu_choice || return 0
         case $MENU_CHOICE in
@@ -198,7 +185,6 @@ settings_menu() {
             4)
                 if [[ $(autostart_chinese) == 开启 ]]; then mutate service_action disable
                 else mutate service_action enable; fi ;;
-            5) backup_menu ;;
             *) msg '请输入菜单中的数字。' ;;
         esac
         menu_pause

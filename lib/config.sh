@@ -49,7 +49,7 @@ config_set() {
 validate_config_file() {
     local file=$1 key value count
     [[ -f $file && ! -L $file ]] || { err '配置必须是普通文件。'; return 1; }
-    # 导入配置不执行任何内容；本工具只允许本机 USB 监控模式。
+    # 配置只按数据读取；本工具只允许本机 USB 监控模式。
     for key in UPSCABLE UPSTYPE DEVICE UPSCLASS UPSMODE NETSERVER NISIP NISPORT TIMEOUT BATTERYLEVEL MINUTES ONBATTERYDELAY KILLDELAY; do
         count=$(awk -v key="$key" '$1==key {n++} END {print n+0}' "$file")
         [[ $count == 1 ]] || { err "$key 必须且只能出现一次。"; return 1; }
@@ -161,13 +161,4 @@ config_change() {
         rm -f -- "$temp"; return 1
     fi
     rm -f -- "$temp"
-}
-
-config_import() { config_apply_file "$1"; }
-
-config_export() {
-    local target=$1
-    [[ -f $CONFIG_FILE ]] || { err '没有可备份的配置。'; return 1; }
-    [[ ! -e $target && ! -L $target ]] || { err '备份目标已存在，请换一个文件名。'; return 1; }
-    cp -a -- "$CONFIG_FILE" "$target" && msg "配置已备份到：$target；请保存到 PVE 系统盘之外。"
 }

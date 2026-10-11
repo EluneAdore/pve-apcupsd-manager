@@ -35,13 +35,12 @@ bootstrap_fetch() {
 
 bootstrap_main() (
     set -uo pipefail
-    local imported='' tool_only=0 info version major
+    local tool_only=0 info version major
     while (( $# )); do
         case $1 in
-            --config) [[ $# -ge 2 ]] || return 2; imported=$2; shift 2 ;;
             --tool-only) tool_only=1; shift ;;
             --help|-h)
-                printf '%s\n' '部署：bash bootstrap.sh [--config 备份文件]' '仅更新管理工具：bash bootstrap.sh --tool-only'
+                printf '%s\n' '部署：bash bootstrap.sh' '仅更新管理工具：bash bootstrap.sh --tool-only'
                 return 0 ;;
             *) bootstrap_error "未知参数：$1。"; return 2 ;;
         esac
@@ -51,11 +50,9 @@ bootstrap_main() (
     info=$(pveversion) || return 1
     version=${info#pve-manager/}; major=${version%%.*}
     [[ $major == 8 || $major == 9 ]] || { bootstrap_error '暂支持 PVE 8、9。'; return 1; }
-    [[ $tool_only == 0 || -z $imported ]] || { bootstrap_error '更新工具不能同时导入配置。'; return 2; }
     trap '[[ -z ${BOOTSTRAP_TMP:-} ]] || rm -rf -- "$BOOTSTRAP_TMP"' EXIT
     bootstrap_fetch || return 1
     if (( tool_only )); then bash "$BOOTSTRAP_BUNDLE/bin/pve-ups" tool-install
-    elif [[ -n $imported ]]; then bash "$BOOTSTRAP_BUNDLE/bin/pve-ups" install --config "$imported"
     else bash "$BOOTSTRAP_BUNDLE/bin/pve-ups" install; fi
 )
 

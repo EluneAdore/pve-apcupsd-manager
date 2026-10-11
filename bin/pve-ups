@@ -13,12 +13,10 @@ show_help() {
 PVE UPS 管理（本机 APC USB / apcupsd）
   pve-ups                         打开中文菜单
   pve-ups status                  查看实时状态与关机计时
-  pve-ups install [--config 文件]  安装或修复，保留已有参数
+  pve-ups install                 安装或修复，保留已有参数
   pve-ups set 参数 值              校验、保存并应用单项参数
   pve-ups upgrade                 升级 apcupsd
   pve-ups service 操作             start/stop/restart/enable/disable
-  pve-ups export 文件              备份配置（目标必须不存在）
-  pve-ups import 文件              恢复配置并应用
   pve-ups diagnose                查看诊断与原始日志
   pve-ups tool-update              更新管理工具到最新版
   pve-ups uninstall [--yes]        本地卸载，恢复首次安装前状态
@@ -32,7 +30,7 @@ HELP
 mutate() { require_root && require_pve && state_validate_paths && with_lock "$@"; }
 
 main() {
-    local command=${1:-menu} imported=''
+    local command=${1:-menu}
     (( $# == 0 )) || shift
     case $command in
         menu) (( $# == 0 )) || return 2; require_root && require_pve && main_menu ;;
@@ -40,16 +38,11 @@ main() {
         help|--help|-h) show_help ;;
         --version) msg "$APP_VERSION" ;;
         install)
-            if (( $# )); then
-                [[ $# == 2 && $1 == --config ]] || { err '用法：pve-ups install [--config 文件]'; return 2; }
-                imported=$2
-            fi
-            mutate lifecycle_install "$imported" ;;
+            (( $# == 0 )) || { err '用法：pve-ups install'; return 2; }
+            mutate lifecycle_install ;;
         set) [[ $# == 2 ]] || { err '用法：pve-ups set 参数 值'; return 2; }; mutate config_change "$1" "$2" ;;
         upgrade) (( $# == 0 )) || return 2; mutate lifecycle_upgrade ;;
         service) [[ $# == 1 ]] || return 2; mutate service_action "$1" ;;
-        export) [[ $# == 1 ]] || return 2; mutate config_export "$1" ;;
-        import) [[ $# == 1 ]] || return 2; mutate config_import "$1" ;;
         diagnose) (( $# == 0 )) || return 2; render_diagnosis ;;
         tool-update) (( $# == 0 )) || { err '用法：pve-ups tool-update'; return 2; }; mutate lifecycle_tool_update ;;
         tool-install) (( $# == 0 )) || return 2; mutate tool_install_bundle ;;
