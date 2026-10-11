@@ -96,9 +96,47 @@ state_snapshot_files() {
     state_copy_path "$DEFAULTS_FILE" "$directory/defaults" "$directory/files.tsv" defaults
 }
 
+state_strip_event_notifications() {
+    local file=$1 output=$2
+    # 只移除本工具的独立配置块；不执行原文件，也不触碰用户的事件脚本。
+    awk '
+        $0 == "# BEGIN pve-ups: event-notifications" {
+            if (inside || ++starts > 1) invalid=1
+            inside=1; next
+        }
+        $0 == "# END pve-ups: event-notifications" {
+            if (!inside || ++ends > 1) invalid=1
+            inside=0; next
+        }
+        !inside { print }
+        END { if (invalid || inside || starts != ends) exit 1 }
+    ' "$file" > "$output"
+}
+
+state_remove_event_notifications() {
+    local file=$1 temporary
+    [[ -e $file || -L $file ]] || return 0
+    [[ -f $file && ! -L $file ]] || return 0
+    awk '$0 == "# BEGIN pve-ups: event-notifications" {found=1} END {exit !found}' "$file" || return 0
+    temporary=$(mktemp "${file}.XXXXXX") || return 1
+    if ! state_strip_event_notifications "$file" "$temporary"; then
+        rm -f -- "$temporary"; err '事件通知配置标记不完整，已保留原文件。'; return 1
+    fi
+    if awk 'NF {found=1} END {exit found}' "$temporary"; then
+        # 初次不存在 config 时，只删除本工具生成且没有后来新增内容的文件。
+        rm -f -- "$temporary" "$file"
+    else
+        if ! chmod --reference="$file" "$temporary" || ! chown --reference="$file" "$temporary" || ! mv -f -- "$temporary" "$file"; then
+            rm -f -- "$temporary"; return 1
+        fi
+    fi
+}
+
 state_restore_files() {
     local directory=$1 configuration_directory=${CONFIG_FILE%/*}
     [[ -f $directory/files.tsv ]] || return 1
+    # 旧版本的首次基线可能没有 config；先清除新增块，再按原有快照恢复。
+    state_remove_event_notifications "$configuration_directory/config" || return 1
     # 路径由受信任的程序常量指定；状态文件只能声明存在或不存在。
     case $(state_get "$directory/files.tsv" config_directory) in
         present)

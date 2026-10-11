@@ -342,6 +342,52 @@ lifecycle_write_config() {
     mv -f -- "$temporary" "$CONFIG_FILE"
 }
 
+lifecycle_configure_event_notifications() {
+    local directory=${CONFIG_FILE%/*} file control temporary prepared
+    file=$directory/config
+    control=$directory/apccontrol
+    LIFECYCLE_EVENTS_CONFIG_CHANGED=no
+    guard_mains || return 1
+    if [[ ! -f $control ]] || ! awk 'index($0, "SCRIPTDIR/config") || index($0, "SCRIPTDIR}/config") {found=1} END {exit !found}' "$control"; then
+        err '原生事件脚本未提供 config 配置入口，无法安全设置菜单事件通知。'; return 1;
+    fi
+    if [[ -e $file || -L $file ]]; then
+        [[ -f $file && ! -L $file ]] || { err '事件通知配置必须是普通文件，已取消修改。'; return 1; }
+        /bin/sh -n "$file" || { err '原有事件通知配置存在语法错误，已取消修改。'; return 1; }
+    fi
+    temporary=$(mktemp "$directory/.pve-ups-events.XXXXXX") || return 1
+    if [[ -f $file ]]; then
+        if ! state_strip_event_notifications "$file" "$temporary" || ! chmod --reference="$file" "$temporary" || ! chown --reference="$file" "$temporary"; then
+            rm -f -- "$temporary"; return 1
+        fi
+    else
+        chmod 644 "$temporary" || { rm -f -- "$temporary"; return 1; }
+    fi
+    # config 在每个原生事件发生时读取；仅静默常规广播，关机和断电分支保持原样。
+    cat >> "$temporary" <<'EOF'
+# BEGIN pve-ups: event-notifications
+case "${1:-}" in
+    onbattery|offbattery|commfailure|commok) WALL=/bin/true ;;
+esac
+# END pve-ups: event-notifications
+EOF
+    if ! /bin/sh -n "$temporary" || ! guard_mains || ! mv -f -- "$temporary" "$file"; then
+        rm -f -- "$temporary"; return 1
+    fi
+    # 事件始终写入 apcupsd 原生日志；不建立额外日志或后台进程。
+    if [[ -z $(config_get EVENTSFILE) ]]; then
+        prepared=$(mktemp "$directory/.pve-ups-event-log.XXXXXX") || return 1
+        if ! awk '$1 == "EVENTSFILE" {if (!written++) print "EVENTSFILE /var/log/apcupsd.events"; next} {print} END {if (!written) print "EVENTSFILE /var/log/apcupsd.events"}' "$CONFIG_FILE" > "$prepared" ||
+           ! guard_mains || ! lifecycle_write_config "$prepared"; then
+            rm -f -- "$prepared"; return 1
+        fi
+        rm -f -- "$prepared"
+        # 由管理工具更新模块读取，决定是否需要重新加载新增的日志配置。
+        # shellcheck disable=SC2034
+        LIFECYCLE_EVENTS_CONFIG_CHANGED=yes
+    fi
+}
+
 lifecycle_check_shutdown_hook() {
     local hook paths
     paths=$(dpkg-query -L apcupsd 2>/dev/null) || { msg '提示：无法读取软件包文件清单，请检查原生关机末期断电脚本。'; return 0; }
@@ -404,7 +450,7 @@ lifecycle_install() (
     validate_config_file "$prepared" || return 1
     # 新装软件的初始默认配置不会在此之前启动。
     guard_mains || return 1
-    lifecycle_write_config "$prepared" && lifecycle_write_defaults || return 1
+    lifecycle_write_config "$prepared" && lifecycle_write_defaults && lifecycle_configure_event_notifications || return 1
     # 通信暂不可确认时仍保留本地诊断和卸载入口，便于断网恢复。
     lifecycle_deploy_bundle || return 1
     systemctl daemon-reload || return 1
@@ -432,6 +478,7 @@ lifecycle_upgrade() (
     guard_mains || return 1
     DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --only-upgrade --no-install-recommends -o Dpkg::Options::=--force-confold apcupsd || return 1
     lifecycle_record_added_packages || return 1
+    lifecycle_configure_event_notifications || return 1
     lifecycle_policy_restore || return 1
     guard_mains || return 1
     state_restore_service "$LIFECYCLE_TX/service.tsv" || return 1

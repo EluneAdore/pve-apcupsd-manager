@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 等待输入时保持页面静止；进入页面或完成操作后更新显示。
+# 菜单每五秒读取状态并原位更新；参数输入时保留正常终端行为。
 
 ups_status_chinese() {
     local state token result=''
@@ -24,11 +24,15 @@ ups_status_chinese() {
 ups_measurement() {
     local key=$1 unit=$2 value
     value=$(ups_value "$key")
-    if [[ $UPS_QUERY_OK != 1 || ! $value =~ ^([0-9]+([.][0-9]+)?) ]]; then
-        msg '未提供 / 无法确认'
-    else
-        printf '%s %s\n' "${BASH_REMATCH[1]}" "$unit"
-    fi
+    [[ $UPS_QUERY_OK == 1 && $value =~ ^([-+]?[0-9]+([.][0-9]+)?)([[:space:]]|$) ]] || return 1
+    printf '%s %s\n' "${BASH_REMATCH[1]}" "$unit"
+}
+
+ups_has_value() {
+    local value
+    [[ $UPS_QUERY_OK == 1 ]] || return 1
+    value=$(ups_value "$1")
+    case ${value^^} in ''|N/A|NA|UNKNOWN|'NOT AVAILABLE') return 1 ;; esac
 }
 
 render_countdown() {
@@ -55,21 +59,23 @@ render_countdown() {
 }
 
 render_status() {
-    local version monitoring model
+    local version monitoring model battery runtime load elapsed readings=''
     version=$(package_version) || version=''
     version=${version:-未安装}
     monitoring='已停止'
     service_active && monitoring='运行中'
     read_ups_snapshot || :
-    model=$(ups_value MODEL); model=${model:-未提供 / 无法确认}
+    model=$(ups_value MODEL)
     msg "──────── PVE UPS 管理 $APP_VERSION ────────"
     msg "apcupsd：$version    监控：$monitoring"
-    msg "UPS 型号：$model"
+    if ups_has_value MODEL; then msg "UPS 型号：$model"; fi
     msg "供电状态：$(ups_status_chinese)"
-    msg "电池电量：$(ups_measurement BCHARGE '%')    剩余续航：$(ups_measurement TIMELEFT 'min')"
-    msg "负载比例：$(ups_measurement LOADPCT '%')"
+    if battery=$(ups_measurement BCHARGE '%'); then readings="电池电量：$battery"; fi
+    if runtime=$(ups_measurement TIMELEFT 'min'); then readings+="${readings:+    }剩余续航：$runtime"; fi
+    [[ -z $readings ]] || msg "$readings"
+    if load=$(ups_measurement LOADPCT '%'); then msg "负载比例：$load"; fi
     if [[ $UPS_QUERY_OK == 1 && " $(ups_value STATUS) " == *' ONBATT '* && $(ups_value STATUS) != *COMMLOST* ]]; then
-        msg "本次停电时长：$(ups_measurement TONBATT 's')"
+        if elapsed=$(ups_measurement TONBATT 's'); then msg "本次停电时长：$elapsed"; fi
     fi
     msg "关机倒计时：$(render_countdown)"
     [[ $monitoring == 运行中 ]] || msg '监控未运行，当前没有自动关机保障。'
@@ -86,18 +92,20 @@ render_details() {
             LINEV) label='输入电压' ;; OUTPUTV) label='输出电压' ;;
             LINEFREQ) label='输入频率' ;; ITEMP) label='设备温度' ;;
             BATTV) label='电池电压' ;; NOMBATTV) label='额定电池电压' ;;
-            BATTDATE) label='电池安装日期' ;; LASTXFER) label='上次切换原因（设备原文）' ;;
+            BATTDATE) label='设备记录的电池日期' ;; LASTXFER) label='上次切换原因（设备原文）' ;;
             XONBATT) label='上次转入电池时间' ;; XOFFBATT) label='上次恢复市电时间' ;;
         esac
+        ups_has_value "$key" || continue
         value=$(ups_value "$key")
-        if [[ -z $value ]]; then value='未提供 / 无法确认'
-        else
-            case $key in
-                LINEV|OUTPUTV|BATTV|NOMBATTV) value=$(ups_measurement "$key" 'V') ;;
-                LINEFREQ) value=$(ups_measurement "$key" 'Hz') ;;
-                ITEMP) value=$(ups_measurement "$key" '°C') ;;
-            esac
-        fi
+        case $key in
+            LINEV|OUTPUTV|BATTV|NOMBATTV) value=$(ups_measurement "$key" 'V') || continue ;;
+            LINEFREQ) value=$(ups_measurement "$key" 'Hz') || continue ;;
+            ITEMP) value=$(ups_measurement "$key" '°C') || continue ;;
+            LASTXFER)
+                if [[ $value == 'No transfers since turnon' ]]; then
+                    label='上次切换原因'; value='开机以来没有供电切换记录'
+                fi ;;
+        esac
         msg "$label：$value"
     done
 }
@@ -129,12 +137,69 @@ autostart_chinese() {
         *) msg '未安装 / 无法确认' ;; esac
 }
 
-menu_clear() { [[ ${TERM:-dumb} == dumb ]] || printf '\033[H\033[2J'; }
+menu_clear() { [[ ${TERM:-dumb} == dumb ]] || printf '\033[H\033[J'; }
+
+menu_terminal_restore() {
+    [[ -z ${MENU_TTY_STATE:-} ]] || stty "$MENU_TTY_STATE" 2>/dev/null || :
+    MENU_TTY_STATE=''
+}
+
+menu_draw() {
+    local renderer=$1 frame line output=$'\033[H'
+    frame=$("$renderer") || return 1
+    frame+=$'\n\n请选择（输入数字并回车）：'
+    frame+="$MENU_INPUT"
+    [[ $frame != "$MENU_LAST_FRAME" ]] || return 0
+    while IFS= read -r line; do output+=$'\033[K'; output+="$line"; output+=$'\n'; done <<< "$frame"
+    # 一次输出整页，不清屏；抹去缩短页面后留下的旧行，并回到输入行。
+    printf '%s\033[J' "${output%$'\n'}"
+    MENU_LAST_FRAME=$frame
+}
 
 menu_choice() {
+    local renderer=$1 character deadline remaining remaining_us result escape count
     MENU_CHOICE=''
-    printf '\n请选择（输入数字并回车）：'
-    IFS= read -r MENU_CHOICE
+    MENU_INPUT=''; MENU_LAST_FRAME=''
+    if [[ ${TERM:-dumb} == dumb ]]; then
+        "$renderer"
+        printf '\n请选择（输入数字并回车）：'
+        IFS= read -r MENU_CHOICE
+        return
+    fi
+    MENU_TTY_STATE=$(stty -g) || return 1
+    stty -echo -icanon min 1 time 0 || { menu_terminal_restore; return 1; }
+    menu_draw "$renderer" || { menu_terminal_restore; return 1; }
+    deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
+    while :; do
+        remaining_us=$((deadline-${EPOCHREALTIME/./}))
+        if (( remaining_us <= 0 )); then
+            menu_draw "$renderer" || { menu_terminal_restore; return 1; }
+            deadline=$(( ${EPOCHREALTIME/./}+5000000 )); continue
+        fi
+        printf -v remaining '%d.%06d' "$((remaining_us/1000000))" "$((remaining_us%1000000))"
+        character=''
+        IFS= read -r -N 1 -t "$remaining" character; result=$?
+        if (( result > 128 )); then continue; fi
+        if (( result != 0 )); then menu_terminal_restore; return 1; fi
+        case $character in
+            $'\n'|$'\r') MENU_CHOICE=$MENU_INPUT; menu_terminal_restore; printf '\n'; return 0 ;;
+            $'\004')
+                if [[ -z $MENU_INPUT ]]; then menu_terminal_restore; return 1; fi
+                MENU_CHOICE=$MENU_INPUT; menu_terminal_restore; printf '\n'; return 0 ;;
+            $'\177'|$'\b') MENU_INPUT=${MENU_INPUT%?} ;;
+            $'\025') MENU_INPUT='' ;;
+            $'\033')
+                # 忽略方向键等终端转义序列，避免把其中的数字当作菜单选择。
+                for ((count=0; count<16; count++)); do
+                    IFS= read -r -N 1 -t 0.05 escape || break
+                    [[ $escape != [A-Za-z~] ]] || break
+                done
+                continue ;;
+            [0-9]) (( ${#MENU_INPUT} >= 8 )) || MENU_INPUT+=$character ;;
+            *) continue ;;
+        esac
+        printf '\r\033[K请选择（输入数字并回车）：%s' "$MENU_INPUT"
+    done
 }
 
 menu_pause() { printf '\n按回车返回…'; IFS= read -r _ || :; }
@@ -158,17 +223,19 @@ menu_edit() {
     mutate config_change "$key" "$converted"
 }
 
+render_settings_menu() {
+    read_ups_snapshot || :
+    msg '──────── UPS 关机设置 ────────'
+    msg "1. 停电多久后关机？           $(current_setting TIMEOUT MAXTIME)"
+    msg "2. 电量低于多少时关机？       $(current_setting BATTERYLEVEL MBATTCHG)"
+    msg "3. 剩余续航少于多久时关机？   $(current_setting MINUTES MINTIMEL)"
+    msg "4. 开机自动监控 UPS           $(autostart_chinese)"
+    msg '0. 返回'
+}
+
 settings_menu() {
     while :; do
-        menu_clear
-        read_ups_snapshot || :
-        msg '──────── UPS 关机设置 ────────'
-        msg "1. 停电多久后关机？           $(current_setting TIMEOUT MAXTIME)"
-        msg "2. 电量低于多少时关机？       $(current_setting BATTERYLEVEL MBATTCHG)"
-        msg "3. 剩余续航少于多久时关机？   $(current_setting MINUTES MINTIMEL)"
-        msg "4. 开机自动监控 UPS           $(autostart_chinese)"
-        msg '0. 返回'
-        menu_choice || return 0
+        menu_choice render_settings_menu || return 0
         case $MENU_CHOICE in
             '') continue ;; 0) return ;;
             1) menu_edit TIMEOUT ;; 2) menu_edit BATTERYLEVEL ;; 3) menu_edit MINUTES ;;
@@ -178,6 +245,18 @@ settings_menu() {
             *) msg '请输入菜单中的数字。' ;;
         esac
         menu_pause
+    done
+}
+
+render_details_menu() {
+    render_details
+    printf '\n0. 返回\n'
+}
+
+details_menu() {
+    while :; do
+        menu_choice render_details_menu || return 0
+        case $MENU_CHOICE in 0) return ;; esac
     done
 }
 
@@ -198,9 +277,37 @@ confirm_uninstall() {
     IFS= read -r answer && [[ $answer == 卸载 ]]
 }
 
+render_events() {
+    local file
+    file=$(config_get EVENTSFILE)
+    file=${file:-/var/log/apcupsd.events}
+    [[ -z ${PVE_ROOT:-} || $file == "$PVE_ROOT/"* ]] || file=$PVE_ROOT$file
+    msg '──────── UPS 事件记录 ────────'
+    if [[ ! -f $file || ! -r $file || ! -s $file ]]; then
+        msg '暂无可读取的事件记录。'
+        return
+    fi
+    tail -n 30 -- "$file" | awk '
+        { gsub(/Power failure\./, "市电中断。")
+          gsub(/Running on UPS batteries\./, "已转为电池供电。")
+          gsub(/Mains returned\. No longer on UPS batteries\./, "市电恢复，已结束电池供电。")
+          gsub(/Power is back\. UPS running on mains\./, "市电恢复，UPS 使用市电供电。")
+          gsub(/Communications with UPS lost\./, "UPS 通信中断。")
+          gsub(/Communications with UPS restored\./, "UPS 通信恢复。")
+          gsub(/Initiating system shutdown!/, "开始执行系统关机！")
+          gsub(/Reached run time limit on batteries\./, "停电等待时间已到。")
+          gsub(/Battery charge below low limit\./, "电量低于保护阈值。")
+          gsub(/Reached remaining time percentage limit on batteries\./, "剩余续航低于保护阈值。")
+          gsub(/Battery power exhausted\./, "电池电量已耗尽。")
+          print }
+    '
+}
+
 render_diagnosis() {
     local candidate
     render_status
+    msg ''
+    render_events
     msg ''
     if require_managed 2>/dev/null; then msg '安装记录：存在'; else msg '安装记录：不存在'; fi
     if [[ -f $CONFIG_FILE ]] && validate_config_file "$CONFIG_FILE" >/dev/null 2>&1; then msg '配置检查：通过'
@@ -211,15 +318,24 @@ render_diagnosis() {
     journalctl -u apcupsd.service -n 60 --no-pager 2>/dev/null || msg '日志不可读取。'
 }
 
+render_main_menu() {
+    render_status
+    printf '\n1. 查看 UPS 详细状态\n2. 修改关机设置\n3. 安装 / 修复 apcupsd\n4. 升级 apcupsd\n5. 管理监控服务\n6. 查看事件记录与诊断\n7. 更新管理工具\n8. 卸载并恢复原状态\n0. 退出\n'
+}
+
 main_menu() {
     [[ -t 0 && -t 1 ]] || { err '交互菜单需要终端；请使用 pve-ups help 查看命令行操作。'; return 1; }
+    MENU_TTY_STATE=''
+    trap 'menu_terminal_restore' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    menu_clear
     while :; do
-        menu_clear; render_status
-        printf '\n1. 查看 UPS 详细状态\n2. 修改关机设置\n3. 安装 / 修复 apcupsd\n4. 升级 apcupsd\n5. 管理监控服务\n6. 查看日志与诊断\n7. 更新管理工具\n8. 卸载并恢复原状态\n0. 退出\n'
-        menu_choice || return 0
+        menu_choice render_main_menu || return 0
         case $MENU_CHOICE in
             '') continue ;; 0) return ;;
-            1) render_details ;;
+            1) details_menu; continue ;;
             2) settings_menu; continue ;;
             3) mutate lifecycle_install ;;
             4) mutate lifecycle_upgrade ;;
