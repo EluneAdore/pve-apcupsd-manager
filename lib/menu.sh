@@ -274,7 +274,7 @@ history_menu_page_size() {
     local rows=24 _columns size
     IFS=' ' read -r rows _columns < <(stty size 2>/dev/null) || rows=24
     [[ $rows =~ ^[0-9]+$ && $rows -ge 24 ]] || rows=24
-    size=$(((rows-15)/4))
+    size=$(((rows-16)/4))
     (( size <= 8 )) || size=8
     printf '%s\n' "$size"
 }
@@ -371,6 +371,7 @@ render_diagnosis() {
     render_events
     msg ''
     if require_managed 2>/dev/null; then msg '安装记录：存在'; else msg '安装记录：不存在'; fi
+    history_diagnostics
     if [[ -f $CONFIG_FILE ]] && validate_config_file "$CONFIG_FILE" >/dev/null 2>&1; then msg '配置检查：通过'
     else msg '配置检查：缺失或不符合本机 USB 方案'; fi
     candidate=$(LC_ALL=C apt-cache policy apcupsd 2>/dev/null | awk '$1=="Candidate:" {print $2; exit}') || candidate=''

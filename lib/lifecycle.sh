@@ -355,6 +355,8 @@ lifecycle_configure_event_notifications() {
         [[ -f $file && ! -L $file ]] || { err '事件通知配置必须是普通文件，已取消修改。'; return 1; }
         /bin/sh -n "$file" || { err '原有事件通知配置存在语法错误，已取消修改。'; return 1; }
     fi
+    # 开启新版回调前标明已有日志的基线；历史失败不阻断原生监控维护。
+    if declare -F history_sync >/dev/null; then history_sync || :; fi
     temporary=$(mktemp "$directory/.pve-ups-events.XXXXXX") || return 1
     if [[ -f $file ]]; then
         if ! state_strip_event_notifications "$file" "$temporary" || ! chmod --reference="$file" "$temporary" || ! chown --reference="$file" "$temporary"; then
@@ -363,16 +365,50 @@ lifecycle_configure_event_notifications() {
     else
         chmod 644 "$temporary" || { rm -f -- "$temporary"; return 1; }
     fi
-    # config 在每个原生事件发生时读取；仅静默常规广播，关机和断电分支保持原样。
+    # config 在用户事件脚本之前读取。父 shell 只读内核时钟与进程身份，
+    # 不查询 UPS、不接触历史文件或等待锁；原生关机分支不进入捕获代码。
     cat >> "$temporary" <<'EOF'
 # BEGIN pve-ups: event-notifications
 case "${1:-}" in
     onbattery|offbattery|commfailure|commok) WALL=/bin/true ;;
 esac
 case "${1:-}" in
-    onbattery|offbattery)
+    powerout|mainsback|onbattery|offbattery)
         if [ -x /usr/local/sbin/pve-ups ]; then
-            /usr/local/sbin/pve-ups history-record "${1}" >/dev/null 2>&1 &
+            pve_ups_capture_event() {
+                pve_ups_hook_event=$1
+                pve_ups_hook_uptime=''
+                pve_ups_hook_boot='unknown'
+                pve_ups_hook_stat=''
+                pve_ups_hook_parent=0
+                pve_ups_hook_birth=0
+                pve_ups_hook_parent_birth=0
+                # /proc/uptime 为 CLOCK_BOOTTIME；保留调用时刻，后台调度延迟
+                # 不改变事件发生时间。PID 加出生 ticks 区分同一秒的事件及重启。
+                { IFS=' ' read -r pve_ups_hook_uptime pve_ups_hook_unused < /proc/uptime; } 2>/dev/null || :
+                { IFS= read -r pve_ups_hook_boot < /proc/sys/kernel/random/boot_id; } 2>/dev/null || :
+                if { IFS= read -r pve_ups_hook_stat < "/proc/$$/stat"; } 2>/dev/null; then
+                    pve_ups_hook_fields=${pve_ups_hook_stat##*) }
+                    # 内核字段从 state 起均为空格分隔且不含 glob 字符。
+                    set -- $pve_ups_hook_fields
+                    pve_ups_hook_parent=${2:-0}
+                    pve_ups_hook_birth=${20:-0}
+                    if { IFS= read -r pve_ups_hook_stat < "/proc/$pve_ups_hook_parent/stat"; } 2>/dev/null; then
+                        pve_ups_hook_fields=${pve_ups_hook_stat##*) }
+                        set -- $pve_ups_hook_fields
+                        pve_ups_hook_parent_birth=${20:-0}
+                    fi
+                fi
+                /usr/local/sbin/pve-ups history-record "$pve_ups_hook_event" \
+                    --captured-uptime "$pve_ups_hook_uptime" \
+                    --boot-id "$pve_ups_hook_boot" \
+                    --session "$pve_ups_hook_boot:$pve_ups_hook_parent:$pve_ups_hook_parent_birth" \
+                    --token "$pve_ups_hook_boot:$$:$pve_ups_hook_birth:$pve_ups_hook_event" \
+                    </dev/null >/dev/null 2>&1 &
+                return 0
+            }
+            pve_ups_capture_event "${1}"
+            unset -f pve_ups_capture_event
         fi
         ;;
 esac
@@ -381,7 +417,7 @@ EOF
     if ! /bin/sh -n "$temporary" || ! guard_mains || ! mv -f -- "$temporary" "$file"; then
         rm -f -- "$temporary"; return 1
     fi
-    # 事件始终写入 apcupsd 原生日志；不建立额外日志或后台进程。
+    # 原生事件日志保持原样；捕获是短时异步命令，不建立常驻监控进程。
     if [[ -z $(config_get EVENTSFILE) ]]; then
         prepared=$(mktemp "$directory/.pve-ups-event-log.XXXXXX") || return 1
         if ! awk '$1 == "EVENTSFILE" {if (!written++) print "EVENTSFILE /var/log/apcupsd.events"; next} {print} END {if (!written) print "EVENTSFILE /var/log/apcupsd.events"}' "$CONFIG_FILE" > "$prepared" ||
