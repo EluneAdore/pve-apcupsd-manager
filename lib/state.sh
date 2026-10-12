@@ -57,19 +57,19 @@ state_service_snapshot() {
         (
             shopt -s globstar nullglob
             for prefix in etc/systemd/system run/systemd/system; do
-                for entry in "${PVE_ROOT:-}/$prefix"/**; do
+                for entry in "/$prefix"/**; do
                     [[ -L $entry ]] || continue
                     case $(readlink "$entry") in */apcupsd.service|apcupsd.service) ;; *) continue ;; esac
-                    relative=${entry#"${PVE_ROOT:-}/"}
+                    relative=${entry#/}
                     [[ $relative != *$'\n'* && $relative != *$'\t'* ]] || return 1
                     mkdir -p -- "$file.links/${relative%/*}" || return 1
                     cp -a -- "$entry" "$file.links/$relative" || return 1
                     printf '%s\n' "$relative" >> "$file.links.list" || return 1
                 done
             done
-            for entry in "${PVE_ROOT:-}"/etc/rc[0-6S].d/*apcupsd; do
+            for entry in /etc/rc[0-6S].d/*apcupsd; do
                 [[ -L $entry ]] || continue
-                relative=${entry#"${PVE_ROOT:-}/"}
+                relative=${entry#/}
                 mkdir -p -- "$file.links/${relative%/*}" || return 1
                 cp -a -- "$entry" "$file.links/$relative" || return 1
                 printf '%s\n' "$relative" >> "$file.links.list" || return 1
@@ -183,14 +183,14 @@ state_restore_service() {
                 [[ -f $manifest.links.list ]] || return 1
                 (
                     shopt -s nullglob
-                    for destination in "${PVE_ROOT:-}"/etc/rc[0-6S].d/*apcupsd; do
+                    for destination in /etc/rc[0-6S].d/*apcupsd; do
                         [[ ! -L $destination ]] || rm -f -- "$destination" || return 1
                     done
                 ) || return 1
                 while IFS= read -r relative; do
                     case $relative in etc/systemd/system/*|run/systemd/system/*|etc/rc[0-6S].d/*apcupsd) ;; *) return 1 ;; esac
                     [[ $relative != *'/../'* && $relative != */.. && -L $manifest.links/$relative ]] || return 1
-                    destination=${PVE_ROOT:-}/$relative
+                    destination=/$relative
                     mkdir -p -- "${destination%/*}" || return 1
                     rm -f -- "$destination" || return 1
                     cp -a -- "$manifest.links/$relative" "$destination" || return 1

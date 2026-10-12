@@ -5,21 +5,13 @@ APP_ROOT=${APP_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
 # 由入口、菜单和更新模块共用。
 # shellcheck disable=SC2034
 APP_VERSION=$(cat "$APP_ROOT/VERSION")
-PVE_ROOT=''
-if [[ ${PVE_UPS_TESTING:-0} == 1 ]]; then
-    [[ ${PVE_UPS_TEST_ROOT:-} == /tmp/* && -d ${PVE_UPS_TEST_ROOT} ]] || {
-        printf '%s\n' '错误：隔离测试根目录必须是 /tmp 中已存在的目录。' >&2
-        return 1
-    }
-    PVE_ROOT=${PVE_UPS_TEST_ROOT%/}
-fi
-STATE_DIR=${STATE_DIR:-$PVE_ROOT/var/lib/pve-ups}
-CONFIG_FILE=${CONFIG_FILE:-$PVE_ROOT/etc/apcupsd/apcupsd.conf}
-DEFAULTS_FILE=${DEFAULTS_FILE:-$PVE_ROOT/etc/default/apcupsd}
+STATE_DIR=${STATE_DIR:-/var/lib/pve-ups}
+CONFIG_FILE=${CONFIG_FILE:-/etc/apcupsd/apcupsd.conf}
+DEFAULTS_FILE=${DEFAULTS_FILE:-/etc/default/apcupsd}
 APPCONFIG_DIR=${APPCONFIG_DIR:-$(dirname -- "$CONFIG_FILE")}
-INSTALL_DIR=${INSTALL_DIR:-$PVE_ROOT/opt/pve-ups}
-COMMAND_PATH=${COMMAND_PATH:-$PVE_ROOT/usr/local/sbin/pve-ups}
-POLICY_FILE=${POLICY_FILE:-$PVE_ROOT/usr/sbin/policy-rc.d}
+INSTALL_DIR=${INSTALL_DIR:-/opt/pve-ups}
+COMMAND_PATH=${COMMAND_PATH:-/usr/local/sbin/pve-ups}
+POLICY_FILE=${POLICY_FILE:-/usr/sbin/policy-rc.d}
 APT_LOG_DIR=${APT_LOG_DIR:-$STATE_DIR/logs}
 HISTORY_FILE=${HISTORY_FILE:-$STATE_DIR/history.tsv}
 UPS_DATA=''
@@ -29,12 +21,11 @@ msg() { printf '%s\n' "$*"; }
 err() { printf '错误：%s\n' "$*" >&2; return 1; }
 
 require_root() {
-    [[ ${PVE_UPS_TESTING:-0} == 1 || $(id -u) == 0 ]] || err '请在 PVE 宿主机使用 root 运行。'
+    [[ $(id -u) == 0 ]] || err '请在 PVE 宿主机使用 root 运行。'
 }
 
 require_pve() {
     local info version major os_id os_version
-    if [[ ${PVE_UPS_TESTING:-0} == 1 ]]; then return 0; fi
     command -v pveversion >/dev/null 2>&1 || { err '当前系统不是 PVE，未修改系统。'; return 1; }
     info=$(pveversion 2>/dev/null) || return 1
     version=${info#pve-manager/}; major=${version%%.*}
@@ -118,7 +109,7 @@ countdown_seconds() {
 
 with_lock() {
     # 锁位于运行时目录，不与卸载删除的恢复记录共用目录。
-    local lockfile=$PVE_ROOT/run/lock/pve-ups.lock rc
+    local lockfile=/run/lock/pve-ups.lock rc
     mkdir -p -- "$(dirname -- "$lockfile")" || return 1
     if [[ ! -e $lockfile ]]; then
         # /run/lock 可能允许其他用户写入，创建时禁止覆盖已有路径。
@@ -127,7 +118,7 @@ with_lock() {
         }
     fi
     [[ -f $lockfile && ! -L $lockfile ]] || { err '管理锁不是普通文件，已取消操作。'; return 1; }
-    if [[ ${PVE_UPS_TESTING:-0} != 1 && $(stat -c '%u' "$lockfile") != 0 ]]; then
+    if [[ $(stat -c '%u' "$lockfile") != 0 ]]; then
         err '管理锁不属于 root，已取消操作。'; return 1
     fi
     (

@@ -89,7 +89,6 @@ history_events_path() {
     local events_log
     events_log=$(config_get EVENTSFILE 2>/dev/null) || events_log=''
     events_log=${events_log:-/var/log/apcupsd.events}
-    [[ -z ${PVE_ROOT:-} || $events_log == "$PVE_ROOT/"* ]] || events_log=$PVE_ROOT$events_log
     printf '%s\n' "$events_log"
 }
 

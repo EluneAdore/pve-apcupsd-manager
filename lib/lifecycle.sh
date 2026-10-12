@@ -151,17 +151,16 @@ lifecycle_can_purge_apcupsd() {
 }
 
 lifecycle_backup_unowned_config() {
-    local backup=$LIFECYCLE_TX/unowned-config directory=${CONFIG_FILE%/*} original_directory relative path package_files
+    local backup=$LIFECYCLE_TX/unowned-config directory=${CONFIG_FILE%/*} relative path package_files
     rm -rf -- "$backup" || return 1
     [[ -d $directory && ! -L $directory ]] || return 0
     cp -a -- "$directory" "$backup" || return 1
     package_files=$(dpkg-query -L apcupsd 2>/dev/null) || {
         err '无法读取监控软件文件归属，已取消清除软件包。'; return 1;
     }
-    original_directory=${directory#"${PVE_ROOT:-}"}
     while IFS= read -r path; do
-        [[ $path == "$original_directory/"* ]] || continue
-        relative=${path#"$original_directory/"}
+        [[ $path == "$directory/"* ]] || continue
+        relative=${path#"$directory/"}
         [[ $relative != *'/../'* && $relative != ../* && $relative != */.. ]] || return 1
         # 软件包目录中可以存在用户文件，只移除明确属于软件包的文件和链接。
         if [[ -L $backup/$relative || -f $backup/$relative ]]; then rm -f -- "$backup/$relative" || return 1; fi
@@ -175,7 +174,7 @@ lifecycle_backup_unowned_config() {
             rmdir -- "$backup/$relative" 2>/dev/null || :
         fi
     done < <(printf '%s\n' "$package_files" |
-        awk -v prefix="$original_directory/" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1) }' |
+        awk -v prefix="$directory/" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1) }' |
         LC_ALL=C sort -r)
     rmdir -- "$backup" 2>/dev/null || :
 }
@@ -472,8 +471,8 @@ lifecycle_show_upgrade_versions() {
 lifecycle_install() (
     local prepared installed_before=no
     require_root && require_pve && state_validate_paths && guard_mains || return 1
-    local legacy_command=${LEGACY_COMMAND_PATH:-${PVE_ROOT:-}/usr/local/bin/pve-ups}
-    local legacy_timer=${LEGACY_TIMER_PATH:-${PVE_ROOT:-}/etc/systemd/system/pve-ups-hid.timer}
+    local legacy_command=${LEGACY_COMMAND_PATH:-/usr/local/bin/pve-ups}
+    local legacy_timer=${LEGACY_TIMER_PATH:-/etc/systemd/system/pve-ups-hid.timer}
     if [[ -e $legacy_command || -L $legacy_command || -e $legacy_timer ]]; then
         err '检测到旧版电源监控工具，请先停用并卸载旧工具，避免重复关机监控。'; return 1
     fi

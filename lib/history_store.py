@@ -9,7 +9,6 @@ import argparse
 from bisect import bisect_right
 import contextlib
 import datetime as dt
-import errno
 import gzip
 import hashlib
 import json
@@ -146,7 +145,7 @@ def boot_clock():
 
 
 class Engine:
-    """Public isolated API. Caller owns the lifecycle flock; SQLite serializes writers."""
+    """历史存储入口；调用方持有文件锁，SQLite 串行处理写入。"""
 
     def __init__(self, state_dir, events_path, legacy_path=None):
         self.state_dir = Path(state_dir)
@@ -155,8 +154,6 @@ class Engine:
         self.database_path = self.state_dir / "history.db"
         self.error_path = self.state_dir / "history-error.json"
         self.db = None
-        self.bytes_read = 0
-        self.lines_parsed = 0
         try:
             if not self.state_dir.is_dir() or self.state_dir.is_symlink():
                 raise OSError("安装状态目录不存在或不安全")
@@ -222,26 +219,11 @@ class Engine:
     def _put_json(self, key, value):
         self._put(key, json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
 
-    def _failpoint(self):
-        if os.environ.get("PVE_UPS_TESTING") != "1":
-            return
-        point = os.environ.get("PVE_UPS_TEST_FAILPOINT", "")
-        if point == "disk-full":
-            raise OSError(errno.ENOSPC, "模拟磁盘空间已满")
-        if point == "write-error":
-            raise PermissionError(errno.EACCES, "模拟历史写入权限错误")
-        if point == "commit-before":
-            raise RuntimeError("模拟提交前写入中断")
-        if point == "pause-before-commit":
-            print("PVE_UPS_TEST_BEFORE_COMMIT", file=sys.stderr, flush=True)
-            time.sleep(30)
-
     @contextlib.contextmanager
     def _transaction(self):
         self.db.execute("BEGIN IMMEDIATE")
         try:
             yield
-            self._failpoint()
             self.db.execute("COMMIT")
         except BaseException:
             if self.db.in_transaction:
@@ -399,7 +381,6 @@ class Engine:
         with opener(path, "rb") as handle:
             handle.seek(start)
             data = handle.read()
-            self.bytes_read += len(data)
         return data
 
     def _suppressed(self, epoch_ns, source_new=False):
@@ -429,7 +410,6 @@ class Engine:
                     prefix_sample = handle.read(row["prefix_len"])
                     handle.seek(max(0, row["offset"] - 128))
                     sample = handle.read(min(128, row["offset"]))
-                    self.bytes_read += len(prefix_sample) + len(sample)
                 reset = stat.st_size < row["offset"] or digest(sample) != row["tail"] or digest(prefix_sample) != row["prefix"]
             elif row is not None and row["compressed"]:
                 # A gzipped rotation is immutable. A changed one gets its own generation.
@@ -498,7 +478,6 @@ class Engine:
             for binary in data[:complete].splitlines(keepends=True):
                 text = binary.decode("utf-8", errors="replace").rstrip("\r\n")
                 identity = f"log:{source}:{position}"
-                self.lines_parsed += 1
                 self._log_event(identity, source, position, text, source_new=reset, source_uncertain=position < ambiguous_prefix)
                 position += len(binary)
             # Fingerprints cover consumed bytes, so appending does not reread old lines.
@@ -508,7 +487,6 @@ class Engine:
                 prefix = handle.read(prefix_len)
                 handle.seek(max(0, final-128))
                 tail = handle.read(min(final, 128))
-                self.bytes_read += len(prefix) + len(tail)
             retained = ((bytes(row["retained"] or b"") if row is not None and not reset else prefix_data) + data[:complete])[-65536:]
             # 保存末尾完整行，供原生 EVENTSFILEMAX 截短后核对。
             if final > len(retained) and b"\n" in retained:

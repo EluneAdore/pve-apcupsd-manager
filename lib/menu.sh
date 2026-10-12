@@ -342,7 +342,6 @@ render_events() {
     local file
     file=$(config_get EVENTSFILE)
     file=${file:-/var/log/apcupsd.events}
-    [[ -z ${PVE_ROOT:-} || $file == "$PVE_ROOT/"* ]] || file=$PVE_ROOT$file
     msg '──────── UPS 事件记录 ────────'
     if [[ ! -f $file || ! -r $file || ! -s $file ]]; then
         msg '暂无可读取的事件记录。'
