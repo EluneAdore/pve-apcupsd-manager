@@ -6,6 +6,7 @@
 """
 
 import argparse
+from bisect import bisect_right
 import contextlib
 import datetime as dt
 import errno
@@ -82,6 +83,13 @@ CREATE TABLE claims(native_id TEXT PRIMARY KEY, hook_token TEXT UNIQUE NOT NULL)
 CREATE TABLE chunks(source TEXT, start INTEGER, end INTEGER, sha TEXT,
  normalized_sha TEXT, body BLOB, PRIMARY KEY(source,start));
 CREATE TABLE source_links(source TEXT, original_source TEXT, consumed INTEGER, mode TEXT);
+CREATE TABLE hook_members(token TEXT PRIMARY KEY, cycle TEXT NOT NULL);
+CREATE INDEX hook_members_cycle ON hook_members(cycle);
+CREATE INDEX evidence_time ON evidence(epoch_ns,event);
+CREATE INDEX hooks_time ON hooks(captured_ns);
+CREATE TABLE snapshots(id INTEGER PRIMARY KEY, observed_ns INTEGER, fingerprint TEXT,
+ raw TEXT NOT NULL, cycle TEXT);
+
 """
 
 
@@ -161,10 +169,26 @@ class Engine:
             # Existing databases do not execute a write PRAGMA on every menu refresh.
             if fresh:
                 self.db.execute("PRAGMA journal_mode=DELETE")
-                self.db.executescript("BEGIN IMMEDIATE;" + SCHEMA + "PRAGMA user_version=1;COMMIT;")
+                self.db.executescript("BEGIN IMMEDIATE;" + SCHEMA + "PRAGMA user_version=2;COMMIT;")
                 os.chmod(self.database_path, 0o600)
-            elif self.db.execute("PRAGMA user_version").fetchone()[0] != 1:
-                raise ValueError("历史数据库版本异常；已保留原文件，未覆盖")
+            else:
+                version = self.db.execute("PRAGMA user_version").fetchone()[0]
+                if version == 1:
+                    # 保留上一实现的全部原始证据，撤销未经身份验证的类型 FIFO 关联。
+                    self.db.executescript("""BEGIN IMMEDIATE;
+                        CREATE TABLE hook_members(token TEXT PRIMARY KEY, cycle TEXT NOT NULL);
+                        CREATE INDEX hook_members_cycle ON hook_members(cycle);
+                        CREATE INDEX evidence_time ON evidence(epoch_ns,event);
+                        CREATE INDEX hooks_time ON hooks(captured_ns);
+                        CREATE TABLE snapshots(id INTEGER PRIMARY KEY, observed_ns INTEGER, fingerprint TEXT,
+                            raw TEXT NOT NULL, cycle TEXT);
+                        DELETE FROM claims WHERE hook_token NOT LIKE 'baseline:%';
+                        INSERT OR REPLACE INTO meta VALUES ('projection_upgrade','1');
+                        PRAGMA user_version=2; COMMIT;""")
+                elif version != 2:
+                    raise ValueError("历史数据库版本异常；已保留原文件，未覆盖")
+                elif not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshots'").fetchone():
+                    self.db.execute("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, observed_ns INTEGER, fingerprint TEXT, raw TEXT NOT NULL, cycle TEXT)")
             self.db.execute("SELECT key,value FROM meta LIMIT 1").fetchone()
             self.db_identity = (self.database_path.stat().st_dev, self.database_path.stat().st_ino)
         except Exception as exc:
@@ -381,13 +405,17 @@ class Engine:
     def _suppressed(self, epoch_ns, source_new=False):
         old = int(self._get("legacy_clear_ns", "0"))
         if old and epoch_ns is not None and epoch_ns <= old:
-            return True
-        # A previously unseen rotated/archive source is not evidence of a new event.
-        # Known source offsets and live callbacks distinguish post-clear same-second events.
+            return 1
         clear = self._json("clear", {})
-        if clear and epoch_ns is not None and epoch_ns < int(clear["wall_ns"]) // 1_000_000_000 * 1_000_000_000:
-            return True
-        return False
+        if clear and epoch_ns is not None:
+            boundary = int(clear["wall_ns"]) // 1_000_000_000 * 1_000_000_000
+            if epoch_ns < boundary:
+                return 1
+            if epoch_ns == boundary:
+                # 秒精度日志不能证明位于清空请求的哪一侧。保存待核查证据，
+                # 不计入清空后的次数；精确 BOOTTIME 的新回调仍独立保留。
+                return 2
+        return 0
 
     def _ingest_logs(self, paths):
         for path, stat in paths:
@@ -398,16 +426,18 @@ class Engine:
             reset = row is None
             if row is not None and not row["compressed"]:
                 with open(path, "rb") as handle:
+                    prefix_sample = handle.read(row["prefix_len"])
                     handle.seek(max(0, row["offset"] - 128))
                     sample = handle.read(min(128, row["offset"]))
-                    self.bytes_read += len(sample)
-                reset = stat.st_size < row["offset"] or digest(sample) != row["tail"]
+                    self.bytes_read += len(prefix_sample) + len(sample)
+                reset = stat.st_size < row["offset"] or digest(sample) != row["tail"] or digest(prefix_sample) != row["prefix"]
             elif row is not None and row["compressed"]:
                 # A gzipped rotation is immutable. A changed one gets its own generation.
                 reset = True
             generation = (row["generation"] + 1) if reset and row is not None else (row["generation"] if row else 0)
             source = f"{stat.st_dev}:{stat.st_ino}:{generation}"
             offset = 0 if reset else row["offset"]
+            ambiguous_prefix = 0
             if reset:
                 data = self._read(path)
                 # 完整分段哈希证明复制；两端小样本仅用于检测原地改写，不能去重。
@@ -417,11 +447,15 @@ class Engine:
                     length = alias["offset"]
                     archive = path != self.events_path
                     same_inode = row is not None and alias["id"] == row["id"]
-                    startup_copy = b"startup succeeded" in data[:length]
-                    normalized_clear_copy = self._json("clear", {}) and length <= len(data) and not self._chunk_match(alias["id"], data, length, normalized=False)
-                    if length <= len(data) and (archive or same_inode or startup_copy or normalized_clear_copy) and self._chunk_match(alias["id"], data, length):
-                        offset = length
-                        linked = (alias["id"], "完整日志前缀复制")
+                    if length <= len(data) and self._chunk_match(alias["id"], data, length):
+                        if archive or same_inode:
+                            offset = length
+                            linked = (alias["id"], "完整日志前缀复制")
+                        else:
+                            # 新活动 inode 中相同字节也可能是同秒重启的新事件。
+                            # 不能声称复制身份已证明；保存整段原始证据供核查。
+                            ambiguous_prefix = length
+                            linked = (alias["id"], "新活动日志相同前缀，来源待核查")
                         break
                 if not offset and row is not None:
                     # apcupsd EVENTSFILEMAX 会在同一 inode 内截短并保留尾部完整行。
@@ -449,7 +483,7 @@ class Engine:
                 if prefix_data:
                     self._store_chunk(source, 0, offset, prefix_data)
                 if linked:
-                    self.db.execute("INSERT INTO source_links VALUES (?,?,?,?)", (source, linked[0], offset, linked[1]))
+                    self.db.execute("INSERT INTO source_links VALUES (?,?,?,?)", (source, linked[0], offset or ambiguous_prefix, linked[1]))
             if data is None:
                 data = self._read(path, offset)
                 absolute_start = offset
@@ -465,7 +499,7 @@ class Engine:
                 text = binary.decode("utf-8", errors="replace").rstrip("\r\n")
                 identity = f"log:{source}:{position}"
                 self.lines_parsed += 1
-                self._log_event(identity, source, position, text, source_new=reset)
+                self._log_event(identity, source, position, text, source_new=reset, source_uncertain=position < ambiguous_prefix)
                 position += len(binary)
             # Fingerprints cover consumed bytes, so appending does not reread old lines.
             opener = gzip.open if path.suffix == ".gz" else open
@@ -503,10 +537,14 @@ class Engine:
         session = state.get("session", "")
         # A snapshot cycle with the exact session/counter identity is the same transfer,
         # even if the device and the log timestamps differ by several seconds.
-        matches = self.db.execute("SELECT id FROM cycles WHERE session=? AND transfer=? AND origin='snapshot'", (session, transfer)).fetchall() if session and state.get("known") else []
+        unique_session = session and state.get("known") and self.db.execute("SELECT COUNT(*) FROM evidence WHERE event='startup' AND epoch_ns=?", (parse_time(session),)).fetchone()[0] <= 1
+        matches = self.db.execute("SELECT id FROM cycles WHERE session=? AND transfer=? AND origin='snapshot' AND visible=1", (session, transfer)).fetchall() if unique_session else []
         if len(matches) == 1:
             cycle = matches[0]["id"]
-            self.db.execute("UPDATE cycles SET start=?,start_ns=?,source=?,origin='log' WHERE id=?", (stamp, epoch_ns, source, cycle))
+            # 原有端点来自快照。稍后同身份的原生日志恢复事件可以纠正它，
+            # 原快照另存为不可变证据，不丢弃设备上报的旧时刻。
+            self._put("end_source:" + cycle, "snapshot")
+            self.db.execute("UPDATE cycles SET start=?,start_ns=?,source=?,origin='log',duration=CASE WHEN end_ns>=? THEN (end_ns-?)/1000000000 ELSE NULL END WHERE id=?", (stamp, epoch_ns, source, epoch_ns, epoch_ns, cycle))
         else:
             # 迁移行先原样保留；仅开始时间相同不能证明它与新事件是同一次。
             cycle = identity
@@ -514,23 +552,22 @@ class Engine:
                             (cycle, stamp, epoch_ns, None, None, None, reason,
                              REASONS.get(reason, reason) or "原因未记录", session,
                              transfer if state.get("known") else None, source, origin))
-        if origin == "log":
-            # 日志恢复后，无法建立会话计数证明的回调证据不能冒充额外已确认切换。
-            # 原始回调和起止仍永久保存，诊断中可查询；不按相近时间强行归并。
-            self.db.execute("UPDATE cycles SET visible=2 WHERE origin='hook' AND visible=1 AND transfer IS NULL")
         state["active"] = cycle
         state["restoring"] = ""
         state["mode"] = "battery"
         return cycle
 
-    def _finish(self, cycle, stamp, epoch_ns):
+    def _finish(self, cycle, stamp, epoch_ns, origin="log"):
         if not cycle:
             return
         row = self.db.execute("SELECT start_ns,end_ns FROM cycles WHERE id=?", (cycle,)).fetchone()
-        if row and row["end_ns"] is None and epoch_ns >= row["start_ns"]:
+        correct_snapshot = origin == "log" and self._get("end_source:" + cycle) == "snapshot"
+        if row and (row["end_ns"] is None or correct_snapshot) and epoch_ns >= row["start_ns"]:
             self.db.execute("UPDATE cycles SET end=?,end_ns=?,duration=? WHERE id=?", (stamp, epoch_ns, (epoch_ns-row["start_ns"])//1_000_000_000, cycle))
+            if origin in ("log", "snapshot"):
+                self._put("end_source:" + cycle, origin)
 
-    def _log_event(self, identity, source, position, text, source_new=False):
+    def _log_event(self, identity, source, position, text, source_new=False, source_uncertain=False):
         if self.db.execute("SELECT 1 FROM evidence WHERE id=?", (identity,)).fetchone():
             return
         match = LINE.match(text)
@@ -553,34 +590,46 @@ class Engine:
         if not event:
             return
         suppressed = self._suppressed(epoch_ns, source_new)
+        if source_uncertain and suppressed != 1:
+            suppressed = 2
+            self._put("input_notice", "新活动日志与已读内容相同，无法证明复制或新事件，原始证据已保留待核查。")
         state = self._json("log_state", {"session": "", "transfer": 0, "known": False, "active": "", "restoring": "", "mode": "unknown"})
+        if source_uncertain:
+            # 来源可能是复制，也可能包含真实新切换；不能将其计数并入
+            # 已确认会话，否则随后 LASTXFER 会被错配到待核查的旧记录。
+            state["known"] = False
         cycle = None
         if event == "startup":
             # An in-flight transfer survives a daemon restart, but the counter starts at
             # zero and no stale session is used to infer its reason/restore timestamp.
-            state.update(session=stamp, transfer=0, known=True, mode="unknown", restoring="")
+            state.update(session=stamp, transfer=0, known=not source_uncertain, mode="unknown", restoring="")
             self._put("active_session", stamp)
             self._put("current_cycle", "")
         elif event == "daemonstop":
             state["mode"] = "unknown"
             self._put("current_cycle", "")
         elif event in ("powerout", "startselftest"):
-            if not suppressed:
+            if suppressed != 1:
                 cycle = self._new_cycle(identity, stamp, epoch_ns, source, state, reason="Automatic or explicit self test" if event == "startselftest" else "")
+                if suppressed == 2:
+                    self.db.execute("UPDATE cycles SET visible=2 WHERE id=? AND visible<>0", (cycle,))
+                    self._put("boundary_notice", "清空边界秒内的日志缺少精确先后证据，已保留待核查；不自动恢复旧记录。")
             else:
                 state["transfer"] = state.get("transfer", 0) + 1
                 state.update(active="", restoring="", mode="unknown")
         elif event == "onbattery":
             cycle = state.get("active")
-            if not cycle and not suppressed:
+            if not cycle and suppressed != 1:
                 # Missing powerout: retain evidence of battery supply, with onset from
                 # this event and a notice rather than inventing an earlier start.
-                cycle = self._new_cycle(identity, stamp, epoch_ns, source, state)
                 state["known"] = False
+                cycle = self._new_cycle(identity, stamp, epoch_ns, source, state)
+                if suppressed == 2:
+                    self.db.execute("UPDATE cycles SET visible=2 WHERE id=? AND visible<>0", (cycle,))
                 self._put("input_notice", "部分事件缺少 powerout；起点仅为首次已记录的电池供电事件。")
         elif event in ("offbattery", "mainsback", "endselftest"):
             cycle = state.get("active") or state.get("restoring")
-            if not suppressed:
+            if suppressed != 1:
                 self._finish(cycle, stamp, epoch_ns)
             if event == "offbattery":
                 state.update(active="", restoring=cycle or "", mode="mains")
@@ -601,23 +650,21 @@ class Engine:
         if "COMMLOST" in status or not parse_time(session) or not transfers.isdigit():
             return None
         transfer = int(transfers)
-        xon = parse_time(values.get("XONBATT", ""))
         rows = self.db.execute("SELECT * FROM cycles WHERE session=? AND transfer=?", (session, transfer)).fetchall()
-        if len(rows) == 1:
+        # 两次 daemon 启动的秒级 STARTTIME 相同也不能确认来自哪一会话。
+        starts = self.db.execute("SELECT COUNT(*) FROM evidence WHERE event='startup' AND epoch_ns=?", (parse_time(session),)).fetchone()[0]
+        state = self._json("log_state", {})
+        if len(rows) == 1 and rows[0]["visible"] == 1 and starts <= 1 and (rows[0]["origin"] == "snapshot" or
+                (state.get("known") and state.get("session") == session)):
             return rows[0]
-        # Compatibility for logs that begin after daemon startup. Exact unique XON is
-        # permitted; equal seconds with multiple cycles is explicitly ambiguous.
-        if xon is not None:
-            rows = self.db.execute("SELECT * FROM cycles WHERE start_ns=?", (xon,)).fetchall()
-            if len(rows) == 1 and rows[0]["session"] in (None, "", session):
-                if rows[0]["session"] != session or rows[0]["transfer"] != transfer:
-                    self.db.execute("UPDATE cycles SET session=?,transfer=? WHERE id=?", (session, transfer, rows[0]["id"]))
-                return self.db.execute("SELECT * FROM cycles WHERE id=?", (rows[0]["id"],)).fetchone()
+        # 相同 XON 秒数不能证明身份：同秒多次切换、重启或旧 TSV 都可能重合。
         return None
 
     def _ingest_snapshot(self, raw):
         values = snapshot_fields(raw)
         if not values:
+            self._put("current_cycle", "")
+            self._put("snapshot", "")
             return
         relevant = {key: values.get(key, "") for key in ("STARTTIME", "NUMXFERS", "XONBATT", "XOFFBATT", "LASTXFER", "STATUS")}
         fingerprint = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
@@ -641,21 +688,24 @@ class Engine:
                 self.db.execute("UPDATE cycles SET reason_raw=?,reason_cn=? WHERE id=?", (raw_reason, REASONS.get(raw_reason, raw_reason), row["id"]))
             xoff = parse_time(values.get("XOFFBATT", ""))
             if "ONBATT" not in status and "ONLINE" in status and xoff is not None:
-                self._finish(row["id"], values["XOFFBATT"], xoff)
+                self._finish(row["id"], values["XOFFBATT"], xoff, origin="snapshot")
             if "ONBATT" in status and "COMMLOST" not in status and row["end_ns"] is None:
                 active = row["id"]
         elif "ONBATT" in status and "COMMLOST" not in status:
             # State alone can confirm ongoing battery supply, but cannot assign a stale
             # reason. Use a complete latest stream only when no restart/loss intervened.
-            if state.get("mode") == "battery":
+            if state.get("mode") == "battery" and (not parse_time(session) or not transfers.isdigit()):
                 active = state.get("active", "")
+        if self._get("snapshot") != fingerprint:
+            self.db.execute("INSERT INTO snapshots(observed_ns,fingerprint,raw,cycle) VALUES (?,?,?,?)",
+                            (time.time_ns(), fingerprint, json.dumps(values, ensure_ascii=False, sort_keys=True), row["id"] if row is not None else None))
         self._put("current_cycle", active)
         self._put("snapshot", fingerprint)
 
     def _snapshot_changed(self, raw):
         values = snapshot_fields(raw)
         if not values:
-            return False
+            return bool(self._get("current_cycle") or self._get("snapshot"))
         relevant = {key: values.get(key, "") for key in ("STARTTIME", "NUMXFERS", "XONBATT", "XOFFBATT", "LASTXFER", "STATUS")}
         if self._get("snapshot") != json.dumps(relevant, sort_keys=True, separators=(",", ":")):
             return True
@@ -670,12 +720,19 @@ class Engine:
         self._migrate()
         self._ingest_logs(self._paths())
         self._ingest_snapshot(raw)
+        for row in self.db.execute("SELECT id,session FROM cycles WHERE origin='snapshot' AND visible=1").fetchall():
+            if self.db.execute("SELECT COUNT(*) FROM evidence WHERE event='startup' AND epoch_ns=?", (parse_time(row["session"]),)).fetchone()[0] > 1:
+                self.db.execute("UPDATE cycles SET visible=2 WHERE id=?", (row["id"],))
+        if self._get("projection_upgrade") == "1":
+            self._rebuild_hook_cycles()
+            self._put("projection_upgrade", "0")
+        self._classify_hook_cycles()
 
     def sync(self, snapshot_raw=""):
         def action():
             paths = self._paths()
             need_baseline = self._get("capture_initialized") != "1"
-            if need_baseline or self._legacy_needed() or self._changed(paths) or self._snapshot_changed(snapshot_raw):
+            if need_baseline or self._legacy_needed() or self._get("projection_upgrade") == "1" or self._changed(paths) or self._snapshot_changed(snapshot_raw):
                 with self._transaction():
                     self._sync_locked(snapshot_raw)
                     if need_baseline:
@@ -686,46 +743,96 @@ class Engine:
             return None
         return self._call(action)
 
-    def _native_for_hook(self, event):
-        # Coverage, not a guessed reason association: one native message can cover
-        # only one invocation. Callback scheduling is allowed to reorder types.
-        return self.db.execute("SELECT e.id FROM evidence e LEFT JOIN claims c ON c.native_id=e.id WHERE e.event=? AND e.suppressed=0 AND c.native_id IS NULL ORDER BY e.rowid LIMIT 1", (event,)).fetchone()
-
     def _rebuild_hook_cycles(self):
-        records = self.db.execute("SELECT h.* FROM hooks h LEFT JOIN claims c ON c.hook_token=h.token WHERE h.suppressed=0 AND c.hook_token IS NULL").fetchall()
+        # 原始回调永不删除。投影允许重算，迟到的 offbattery 可纠正先收到的
+        # mainsback；同一 boot 的出生 ticks/BOOTTIME 决定顺序，工作者到达无关。
+        fence = self._json("clear", {})
+        if fence:
+            # schema 1 的清空只隐藏投影，未更新回调墓碑；升级重建时补齐，
+            # 避免原先被错误 claim 的旧回调在新版成为新事件。
+            for record in self.db.execute("SELECT * FROM hooks WHERE suppressed=0").fetchall():
+                if self._hook_before_fence(record, fence):
+                    self.db.execute("UPDATE hooks SET suppressed=1 WHERE token=?", (record["token"],))
+        records = self.db.execute("SELECT * FROM hooks WHERE suppressed=0").fetchall()
+        boot_order = {}
+        for record in records:
+            boot_order[record["boot"]] = min(boot_order.get(record["boot"], record["captured_ns"]), record["captured_ns"])
         def order(record):
             pieces = record["token"].split(":")
-            if len(pieces) >= 4 and pieces[-2].isdigit() and pieces[-3].isdigit():
-                return (record["boot"] or "", record["session"] or "", int(pieces[-2]), int(pieces[-3]), record["captured_ns"])
-            return (record["boot"] or "", record["session"] or "", record["captured_ns"], 0, 0)
-        records = sorted(records, key=order)
-        states = {}
+            uptime = record["uptime"]
+            if len(pieces) >= 4 and pieces[-2].isdigit() and pieces[-3].isdigit() and int(pieces[-2]) > 0:
+                position = int(pieces[-2]) / os.sysconf("SC_CLK_TCK")
+                tie = int(pieces[-3])
+            elif uptime is not None:
+                position, tie = uptime, 0
+            else:
+                position, tie = record["captured_ns"] / 1_000_000_000, 0
+            # 同精度内根据 native 事件语义排序；不丢弃同秒不同调用。
+            rank = {"powerout": 0, "onbattery": 1, "offbattery": 2, "mainsback": 3}[record["event"]]
+            return (boot_order[record["boot"]], position, tie, record["captured_ns"], rank, record["token"])
+        records.sort(key=order)
+        self.db.execute("DELETE FROM hook_members")
+        self.db.execute("UPDATE cycles SET end=NULL,end_ns=NULL,duration=NULL WHERE origin='hook'")
+        active, restoring, current_boot = "", "", None
+        projected = set()
         for record in records:
-            key = (record["boot"], record["session"])
-            state = states.setdefault(key, {"active": "", "restoring": "", "transfer": 0, "known": False, "session": record["session"], "mode": "unknown"})
+            if current_boot != record["boot"]:
+                active, restoring, current_boot = "", "", record["boot"]
             event, token, epoch_ns = record["event"], record["token"], record["captured_ns"]
             stamp = stamp_from_ns(epoch_ns)
             if event in ("powerout", "onbattery"):
-                if event == "onbattery" and state.get("active"):
-                    continue
-                cycle = "hook:" + token
-                row = self.db.execute("SELECT id FROM cycles WHERE id=?", (cycle,)).fetchone()
-                if not row:
-                    self._new_cycle(cycle, stamp, epoch_ns, "hook", state, origin="hook")
+                if event == "onbattery" and active:
+                    cycle = active
                 else:
-                    state.update(active=cycle, restoring="", mode="battery")
+                    cycle = "hook:" + token
+                    self.db.execute("INSERT OR IGNORE INTO cycles VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                        (cycle, stamp, epoch_ns, None, None, None, "", "原因未记录", record["session"], None, "hook", "hook"))
+                    active, restoring = cycle, ""
+                projected.add(cycle)
             else:
-                cycle = state.get("active") or state.get("restoring")
-                self._finish(cycle, stamp, epoch_ns)
-                state.update(active="", restoring=cycle if event == "offbattery" else "", mode="mains")
-        # A raw callback proves an event, not the current state after its worker runs.
-        # Current supply status is confirmed separately by a trustworthy snapshot.
+                cycle = active or restoring
+                self._finish(cycle, stamp, epoch_ns, origin="hook")
+                active, restoring = "", cycle if event == "offbattery" else ""
+            if cycle:
+                self.db.execute("INSERT INTO hook_members VALUES (?,?)", (token, cycle))
+        # 迟到 powerout 使先前单独 onbattery 成为确认消息，保留证据而移除旧投影。
+        for row in self.db.execute("SELECT id FROM cycles WHERE origin='hook'").fetchall():
+            if row["id"] not in projected:
+                self.db.execute("UPDATE cycles SET visible=3 WHERE id=? AND visible<>0", (row["id"],))
+        self._classify_hook_cycles()
+
+    def _classify_hook_cycles(self):
+        # 无跨源唯一身份时不认领日志、更不分配原因。相交的记录属于待核查
+        # 证据，绝不声称已合并；明确互不相交的完整回调周期继续独立计数。
+        # 恢复时间未知不是瞬间结束：不能据此证明后来的证据是独立事件。
+        intervals = sorted((row["start_ns"] // 1_000_000_000,
+                            row["end_ns"] // 1_000_000_000 if row["end_ns"] is not None else math.inf)
+                           for row in self.db.execute("SELECT start_ns,end_ns FROM cycles WHERE origin IN ('log','snapshot') AND visible=1"))
+        starts, furthest = [], []
+        for start, end in intervals:
+            starts.append(start)
+            furthest.append(max(end, furthest[-1] if furthest else end))
+        for hook in self.db.execute("SELECT * FROM cycles WHERE origin='hook' AND visible IN (1,2)").fetchall():
+            start = hook["start_ns"] // 1_000_000_000
+            end = hook["end_ns"] // 1_000_000_000 if hook["end_ns"] is not None else math.inf
+            index = bisect_right(starts, end) - 1
+            overlaps = index >= 0 and furthest[index] >= start
+            visible = 2 if overlaps else 1
+            if hook["visible"] != visible:
+                self.db.execute("UPDATE cycles SET visible=? WHERE id=?", (visible, hook["id"]))
+        # 当前状态只由最新成功状态查询确认，不由迟到的回调假定。
 
     def capture(self, event, captured_ns=None, token=None, session="", log_anchor=None,
                 snapshot_raw="", captured_uptime=None, boot_id=""):
         if event not in ("powerout", "onbattery", "offbattery", "mainsback"):
             raise ValueError("不支持的历史事件类型")
         now_boot, now_uptime = boot_clock()
+        derived_time = captured_ns is None and captured_uptime is not None
+        pieces = str(token or "").split(":")
+        if captured_ns is None and captured_uptime is not None and len(pieces) >= 4 and pieces[-2].isdigit() and pieces[-3].isdigit() and int(pieces[-2]) > 0:
+            # apcupsd 在 fork 前写原生事件，子进程可能晚获调度。出生 ticks
+            # 比脚本首次运行的 /proc/uptime 更接近触发时刻，也可靠保留因果顺序。
+            captured_uptime = min(float(captured_uptime), int(pieces[-2]) / os.sysconf("SC_CLK_TCK"))
         if captured_uptime is not None and captured_ns is None:
             captured_ns = time.time_ns() - int((now_uptime-float(captured_uptime))*1_000_000_000)
         captured_ns = int(captured_ns if captured_ns is not None else time.time_ns())
@@ -736,35 +843,71 @@ class Engine:
                 return None
             with self._transaction():
                 self._sync_locked(snapshot_raw)
+                event_ns = captured_ns
+                if derived_time:
+                    # 同一 boot 的 epoch 换算基线只写一次，消除每个工作者
+                    # 读取两个时钟造成的微小偏差，保留同 tick 原生因果顺序。
+                    key = "boot_epoch:" + boot_id
+                    epoch = self._get(key)
+                    if not epoch:
+                        epoch = str(time.time_ns() - int(boot_clock()[1] * 1_000_000_000))
+                        self._put(key, epoch)
+                    event_ns = int(epoch) + round(float(captured_uptime) * 1_000_000_000)
                 clear = self._json("clear", {})
                 old = False
                 if clear:
-                    if captured_uptime is not None and boot_id == clear.get("boot"):
-                        old = float(captured_uptime) <= clear["uptime"]
-                    elif captured_ns <= clear["wall_ns"]:
-                        old = True
-                self.db.execute("INSERT INTO hooks VALUES (?,?,?,?,?,?,?,?,?)", (token, event, captured_ns, boot_id, captured_uptime, session, json.dumps(log_anchor or {}, sort_keys=True), json.dumps(snapshot_fields(snapshot_raw), sort_keys=True), int(old)))
+                    old = self._hook_before_fence({"token": token, "uptime": captured_uptime, "boot": boot_id, "captured_ns": event_ns}, clear)
+                self.db.execute("INSERT INTO hooks VALUES (?,?,?,?,?,?,?,?,?)", (token, event, event_ns, boot_id, captured_uptime, session, json.dumps(log_anchor or {}, sort_keys=True), json.dumps(snapshot_fields(snapshot_raw), sort_keys=True), int(old)))
                 self._put("capture_initialized", "1")
-                native = self._native_for_hook(event) if not old else None
-                if native:
-                    self.db.execute("INSERT INTO claims VALUES (?,?)", (native["id"], token))
                 if not old:
                     self._rebuild_hook_cycles()
             return None
         return self._call(action)
 
-    def clear(self, snapshot_raw="", captured_ns=None):
+    @staticmethod
+    def _hook_before_fence(hook, fence):
+        if hook["uptime"] is not None and hook["boot"] == fence.get("boot"):
+            token = hook["token"].split(":")
+            if fence.get("birth_ticks") and len(token) >= 4 and token[-2].isdigit() and token[-3].isdigit() and int(token[-2]) > 0:
+                birth = int(token[-2])
+                if birth != fence["birth_ticks"]:
+                    return birth < fence["birth_ticks"]
+                # 同 tick 的 PID 不同仍是独立调用，不以相等的低精度 uptime 删除。
+                return int(token[-3]) <= fence["pid"]
+            return float(hook["uptime"]) <= fence["uptime"]
+        if hook["boot"] in fence.get("prior_boots", []):
+            return True
+        return hook["captured_ns"] <= fence["wall_ns"]
+
+    def clear(self, snapshot_raw="", captured_ns=None, captured_uptime=None, boot_id="", clear_pid=0, clear_birth=0):
+        # 请求发生时采集边界，而不是事务取得写锁以后。
+        boot, uptime = boot_clock()
+        if captured_ns is None:
+            captured_ns = time.time_ns()
+            if captured_uptime is not None and (not boot_id or boot_id == boot):
+                captured_ns -= int((uptime-float(captured_uptime))*1_000_000_000)
+        request_boot = boot_id or boot
+        request_uptime = float(captured_uptime) if captured_uptime is not None else uptime
         def action():
             with self._transaction():
                 # Consume existing input and advance each cursor in the same transaction
                 # as the clear. Raw byte identities remain tombstones for replay/rotation.
                 self._sync_locked(snapshot_raw)
-                boot, uptime = boot_clock()
                 values = snapshot_fields(snapshot_raw)
-                fence = {"wall_ns": int(captured_ns if captured_ns is not None else time.time_ns()), "boot": boot, "uptime": uptime,
-                         "last_xon_ns": parse_time(values.get("XONBATT", "")) or 0, "snapshot_session": values.get("STARTTIME", "")}
+                fence = {"wall_ns": int(captured_ns), "boot": request_boot, "uptime": request_uptime,
+                         "pid": clear_pid, "birth_ticks": clear_birth,
+                         "last_xon_ns": parse_time(values.get("XONBATT", "")) or 0, "snapshot_session": values.get("STARTTIME", ""),
+                         "prior_boots": [row[0] for row in self.db.execute("SELECT DISTINCT boot FROM hooks WHERE boot<>?", (request_boot,))]}
                 self._put_json("clear", fence)
-                self.db.execute("UPDATE cycles SET visible=0 WHERE visible IN (1,2) AND start_ns<=?", (fence["wall_ns"],))
+                self.db.execute("UPDATE cycles SET visible=0 WHERE visible IN (1,2) AND origin<>'hook' AND start_ns<=?", (fence["wall_ns"],))
+                for hook in self.db.execute("SELECT c.id,h.* FROM cycles c JOIN hooks h ON c.id='hook:'||h.token WHERE c.visible IN (1,2)").fetchall():
+                    before = self._hook_before_fence(hook, fence)
+                    if before:
+                        self.db.execute("UPDATE cycles SET visible=0 WHERE id=?", (hook["id"],))
+                for hook in self.db.execute("SELECT * FROM hooks WHERE suppressed=0").fetchall():
+                    if self._hook_before_fence(hook, fence):
+                        self.db.execute("UPDATE hooks SET suppressed=1 WHERE token=?", (hook["token"],))
+                self._classify_hook_cycles()
                 current = self._get("current_cycle")
                 if current and self.db.execute("SELECT visible FROM cycles WHERE id=?", (current,)).fetchone()[0] == 0:
                     self._put("current_cycle", "")
@@ -774,7 +917,7 @@ class Engine:
 
     def _notice(self):
         try:
-            notices = [self._get("migration_notice"), self._get("input_notice")]
+            notices = [self._get("migration_notice"), self._get("input_notice"), self._get("boundary_notice")]
         except sqlite3.DatabaseError:
             notices = ["历史数据库异常；原文件已保留，未覆盖。"]
         try:
@@ -790,7 +933,7 @@ class Engine:
         try:
             pending = self.db.execute("SELECT COUNT(*) FROM cycles WHERE visible=2").fetchone()[0]
             if pending:
-                notices.append(f"有 {pending} 份回调证据待核查：未能与原生日志建立唯一关联，不计入已确认切换次数；请查看诊断。")
+                notices.append(f"有 {pending} 份证据待核查：跨来源身份或清空边界无法确认，不计入已确认切换次数；详情及原始调用见诊断和 history --json。")
         except sqlite3.DatabaseError:
             pass
         return " ".join(item for item in notices if item)
@@ -814,7 +957,8 @@ class Engine:
             row["state"] = "restored" if row["end_ns"] is not None else ("active" if row["id"] == current else "unknown")
             row["evidence"] = clean(row["source"]) + " / " + row["origin"]
             rows.append(row)
-        return {"summary": summary, "rows": rows, "notice": self._notice(), "page": page}
+        pending = [dict(row) for row in self.db.execute("SELECT * FROM cycles WHERE visible=2 ORDER BY start_ns DESC,id DESC" + (" LIMIT ? OFFSET ?" if size else ""), (size, (page-1)*size) if size else ())]
+        return {"summary": summary, "rows": rows, "pending": pending, "notice": self._notice(), "page": page}
 
     def pages(self, size):
         size = max(1, int(size))
@@ -837,7 +981,9 @@ class Engine:
             unresolved = self.db.execute("SELECT COUNT(*) FROM hooks WHERE suppressed=0").fetchone()[0]
             info.append(f"持久保存的原生回调证据：{unresolved} 条（回调调度顺序不代替原生日志顺序）")
             for row in self.db.execute("SELECT * FROM cycles WHERE visible=2 ORDER BY start_ns"):
-                info.append(f"待核查回调：{row['start']} → {row['end'] or '恢复时间未知'}；原因未记录；证据 {row['id']}")
+                info.append(f"待核查证据：{row['start']} → {row['end'] or '恢复时间未知'}；{row['reason_cn']}；证据 {row['id']}")
+            for row in self.db.execute("SELECT token,event,session,captured_ns,suppressed FROM hooks ORDER BY captured_ns"):
+                info.append(f"原始回调：{row['token']}；{row['event']}；{stamp_from_ns(row['captured_ns'])}；会话 {row['session']}；清空前证据 {row['suppressed']}")
         except sqlite3.DatabaseError:
             info.append("历史数据库暂时无法读取；请先保留损坏文件，再进行修复。")
         return "\n".join(info)
@@ -854,6 +1000,12 @@ def output_tsv(data):
 
 
 def main():
+    if sys.argv[1:] == ["clock"]:
+        # 清空专用的因果边界。无状态目录操作、无 UPS 查询或服务操作。
+        boot, _ = boot_clock()
+        birth = int(Path("/proc/self/stat").read_text().rpartition(") ")[2].split()[19])
+        print(f"{boot}\t{birth / os.sysconf('SC_CLK_TCK')}\t{os.getpid()}\t{birth}")
+        return 0
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--events", required=True)
@@ -868,6 +1020,8 @@ def main():
     parser.add_argument("--log-dev", type=int)
     parser.add_argument("--log-ino", type=int)
     parser.add_argument("--log-offset", type=int)
+    parser.add_argument("--clear-pid", type=int, default=0)
+    parser.add_argument("--clear-birth", type=int, default=0)
     parser.add_argument("--page", type=int, default=1)
     parser.add_argument("--size", type=int, default=0)
     parser.add_argument("--json", action="store_true")
@@ -882,7 +1036,7 @@ def main():
             anchor = {"dev": args.log_dev, "ino": args.log_ino, "offset": args.log_offset} if args.log_ino is not None else None
             engine.capture(args.event, args.captured_ns, args.token, args.session, anchor, raw, args.captured_uptime, args.boot_id)
         elif args.command == "clear":
-            engine.clear(raw, args.captured_ns)
+            engine.clear(raw, args.captured_ns, args.captured_uptime, args.boot_id, args.clear_pid, args.clear_birth)
         elif args.command == "pages":
             print(engine.pages(args.size))
         elif args.command == "diagnostics":
@@ -890,6 +1044,7 @@ def main():
         else:
             data = engine.query(args.page, args.size)
             if args.json:
+                data["proof"] = {table: [dict(row) for row in engine.db.execute("SELECT * FROM " + table)] for table in ("evidence", "hooks", "snapshots", "claims", "source_links", "hook_members")}
                 print(json.dumps(data, ensure_ascii=False))
             else:
                 output_tsv(data)

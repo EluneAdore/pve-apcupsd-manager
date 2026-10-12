@@ -123,8 +123,14 @@ history_sync() {
 }
 
 history_clear() {
+    local request_uptime='' request_boot='' request_pid='' request_birth='' request_clock
+    # 发起请求时保存时钟；UPS 查询及排队取锁不能移动清空边界。
+    # 专用进程身份区分同一内核 tick 内的清空和回调；此操作只在用户清空时运行。
+    request_clock=$(python3 -B "$APP_ROOT/lib/history_store.py" clock) || return 1
+    IFS=$'\t' read -r request_boot request_uptime request_pid request_birth <<< "$request_clock"
     read_ups_snapshot || :
-    history_call clear <<< "${UPS_DATA:-}"
+    history_call clear --captured-uptime "$request_uptime" --boot-id "$request_boot" \
+        --clear-pid "$request_pid" --clear-birth "$request_birth" <<< "${UPS_DATA:-}"
 }
 
 history_record_event() {

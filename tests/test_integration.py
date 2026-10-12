@@ -4,6 +4,7 @@ import importlib.util
 import json
 import fcntl
 import subprocess
+import tarfile
 import time
 from pathlib import Path
 import sys
@@ -44,6 +45,93 @@ class HistoryIntegrationTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["duration"], 1)
         self.assertEqual(rows[0]["reason_cn"], "原因未记录")
+
+    def test_real_cli_four_callbacks_no_snapshot_or_log_anchor(self):
+        self.pve.set_fake(query_fail=True)
+        for event, seconds in (("powerout", 1), ("onbattery", 1), ("offbattery", 2), ("mainsback", 2)):
+            self.record(event, seconds, "cli-no-query-" + event)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["duration"], 1)
+        self.assertEqual(rows[0]["reason_cn"], "原因未记录")
+        self.assertFalse(rows[0]["reason_raw"])
+        self.assertEqual(rows[0]["state"], "restored")
+
+    def test_first_cli_capture_does_not_consume_existing_log_history(self):
+        self.pve.set_fake(query_fail=True)
+        self.pve.write_log([(stamp(0), "apcupsd 3.14.14 (31 May 2016) debian startup succeeded"), (stamp(1), "Power failure."), (stamp(2), "Power is back. UPS running on mains.")])
+        # 没有先运行 history/status：首个真实回调不得把旧事件当成自己的证据。
+        self.record("powerout", 20, "new-after-existing-log-start")
+        self.record("mainsback", 21, "new-after-existing-log-end")
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sorted(row["duration"] for row in rows), [1, 1])
+
+    def test_real_cli_two_distinct_same_second_cycles_no_snapshot(self):
+        self.pve.set_fake(query_fail=True)
+        for event, extra, token in (("powerout", 100, "first-start"), ("mainsback", 200, "first-end"), ("powerout", 300, "second-start"), ("mainsback", 400, "second-end")):
+            self.pve.cli("history-record", event, "--captured-ns", str(nanos(1, extra)), "--session", "daemon-A", "--token", token)
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({row["id"] for row in rows}), 2)
+        self.assertTrue(all(row["state"] == "restored" for row in rows))
+
+    def test_real_cli_restoration_after_same_second_daemon_restart(self):
+        self.pve.set_fake(query_fail=True)
+        self.pve.cli("history-record", "powerout", "--captured-ns", str(nanos(1, 100)), "--session", "daemon-A", "--token", "old-session-start")
+        self.pve.cli("history-record", "mainsback", "--captured-ns", str(nanos(1, 300)), "--session", "daemon-B", "--token", "restarted-session-end")
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "restored")
+        self.assertEqual(rows[0]["duration"], 0)
+
+    def test_real_cli_unchanged_status_does_not_rewrite_database(self):
+        self.pve.write_log([(stamp(1), "Power failure."), (stamp(2), "Power is back. UPS running on mains.")])
+        self.pve.cli("history")
+        database = self.pve.state_dir / "history.db"
+        before = (database.read_bytes(), database.stat().st_mtime_ns, database.stat().st_ino)
+        for _ in range(3):
+            self.pve.cli("status")
+        self.assertEqual((database.read_bytes(), database.stat().st_mtime_ns, database.stat().st_ino), before)
+
+    def test_real_cli_json_exposes_pending_identity_and_diagnostic_raw_tokens(self):
+        self.pve.set_fake(query_fail=True)
+        self.record("powerout", 1, "cli-pending-start")
+        self.record("mainsback", 2, "cli-pending-end")
+        self.pve.write_log([(stamp(0), "apcupsd 3.14.14 (31 May 2016) debian startup succeeded"), (stamp(1), "Power failure."), (stamp(2), "Power is back. UPS running on mains.")])
+        current = snapshot("ONLINE", stamp(1), stamp(2), "Low line voltage")
+        current.update(STARTTIME=stamp(0), NUMXFERS="1")
+        self.pve.set_fake(query_fail=False, snapshot=current)
+        result = json.loads(self.pve.cli("history", "--json").stdout)
+        self.assertEqual(result["summary"]["count"], 1)
+        self.assertEqual(result["summary"]["unassociated"], 1)
+        self.assertEqual(len(result["rows"]), 1)
+        self.assertEqual(len(result["pending"]), 1)
+        pending = result["pending"][0]
+        self.assertEqual(pending["id"], "hook:cli-pending-start")
+        self.assertEqual(pending["origin"], "hook")
+        self.assertEqual(pending["source"], "hook")
+        self.assertFalse(pending["reason_raw"])
+        self.assertEqual(pending["reason_cn"], "原因未记录")
+        self.assertNotEqual(result["rows"][0]["id"], pending["id"])
+        proof = result["proof"]
+        self.assertEqual({hook["token"] for hook in proof["hooks"]}, {"cli-pending-start", "cli-pending-end"})
+        self.assertEqual({hook["event"] for hook in proof["hooks"]}, {"powerout", "mainsback"})
+        self.assertTrue(all(hook["captured_ns"] and hook["session"] == "daemon-A" for hook in proof["hooks"]))
+        self.assertEqual(len(proof["evidence"]), 3)
+        self.assertTrue(all(evidence["id"] and evidence["source"] and evidence["position"] is not None for evidence in proof["evidence"]))
+        self.assertEqual({member["token"] for member in proof["hook_members"]}, {"cli-pending-start", "cli-pending-end"})
+        self.assertTrue(all(member["cycle"] == pending["id"] for member in proof["hook_members"]))
+        self.assertEqual(len(proof["snapshots"]), 1)
+        saved = proof["snapshots"][0]
+        self.assertEqual(saved["cycle"], result["rows"][0]["id"])
+        self.assertEqual(json.loads(saved["raw"])["LASTXFER"], "Low line voltage")
+        self.assertEqual(json.loads(saved["raw"])["XONBATT"], stamp(1))
+        self.assertEqual(json.loads(saved["raw"])["XOFFBATT"], stamp(2))
+        diagnosis = self.pve.cli("diagnose").stdout
+        self.assertIn(pending["id"], diagnosis)
+        self.assertIn("cli-pending-start", diagnosis)
+        self.assertIn("cli-pending-end", diagnosis)
 
     def test_all_official_reasons_translated_and_unknown_value_preserved(self):
         official = {"No transfers since turnon": "开机以来无供电切换", "Automatic or explicit self test": "自动或手动触发电池自检", "Forced by software": "软件控制强制切换", "Low line voltage": "输入市电电压过低", "High line voltage": "输入市电电压过高", "Unacceptable line voltage changes": "输入市电电压波动超出允许范围", "Line voltage notch or spike": "市电电压出现陷波或尖峰", "Input frequency out of range": "输入市电频率超标", "UNKNOWN EVENT": "未知切换事件", "Vendor custom reason": "Vendor custom reason"}
@@ -89,6 +177,51 @@ class HistoryIntegrationTests(unittest.TestCase):
         self.pve.cli("history")
         self.assertEqual(lock.stat().st_ino, old_inode)
 
+    def test_actual_shell_clear_keeps_new_capture_while_waiting_for_lock(self):
+        self.pve.set_fake(query_fail=True)
+        self.record("powerout", 1, "old-before-queued-clear-start")
+        self.record("mainsback", 2, "old-before-queued-clear-end")
+        lock = self.pve.state_dir / "history.tsv.lock"
+        preamble = 'set -uo pipefail; for module in ' + MODULES + '; do source "$APP_ROOT/lib/$module.sh" || exit; done; '
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            clearer = subprocess.Popen(["bash", "-c", preamble + "history_clear"], env=self.pve.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(lambda: clearer.poll() is not None or clearer.kill())
+            # 观察实际 flock 子进程，保证清空请求已发出且在等待；不用睡眠猜测。
+            deadline = time.monotonic() + 3
+            blocked = False
+            while time.monotonic() < deadline:
+                pending = [clearer.pid]
+                while pending:
+                    pid = pending.pop()
+                    try:
+                        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                        pending.extend(int(child) for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split())
+                    except (FileNotFoundError, ProcessLookupError):
+                        continue
+                    if args and Path(args[0].decode(errors="replace")).name == "flock":
+                        blocked = True
+                        break
+                if blocked:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(blocked, "正式清空函数未进入历史锁等待")
+            # 模拟另一个先获写锁的事件写入者；事件发生在清空请求之后。
+            engine = self.module.Engine(str(self.pve.state_dir), str(self.pve.log))
+            try:
+                after_request = time.time_ns()
+                engine.capture("powerout", after_request, "new-after-clear-request-start", session="daemon-A")
+                engine.capture("mainsback", after_request + 100, "new-after-clear-request-end", session="daemon-A")
+            finally:
+                engine.close()
+            fcntl.flock(held, fcntl.LOCK_UN)
+        output, errors = clearer.communicate(timeout=3)
+        self.assertEqual(clearer.returncode, 0, (output, errors))
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["start_ns"], after_request)
+        self.assertEqual(rows[0]["state"], "restored")
+
     def test_uninstall_and_waiting_history_writer_leave_no_orphan_state(self):
         self.record("powerout", 1, "before-removal")
         lock = self.pve.state_dir / "history.tsv.lock"
@@ -133,6 +266,29 @@ class HistoryIntegrationTests(unittest.TestCase):
         self.assertFalse(self.pve.state_dir.exists())
         self.pve.cli("install")
         self.assertTrue((self.pve.state_dir / "manifest.tsv").exists())
+
+    def test_actual_tool_update_download_path_preserves_history_and_baseline(self):
+        import shutil
+        shutil.rmtree(self.pve.state_dir)
+        self.pve.set_fake(installed=True)
+        self.pve.write_config()
+        self.pve.cli("install")
+        self.pve.write_log([(stamp(1), "Power failure."), (stamp(3), "Power is back. UPS running on mains.")])
+        self.pve.cli("history")
+        rows = self.rows()
+        baseline = (self.pve.state_dir / "baseline/files.tsv").read_bytes()
+        archive = self.pve.root / "fixture-main.tar.gz"
+        with tarfile.open(archive, "w:gz") as output:
+            for name in ("VERSION", "README.md", "bootstrap.sh", "bin", "lib"):
+                output.add(REPO / name, arcname="pve-apcupsd-manager-main/" + name)
+        self.pve.env["PVE_UPS_TEST_ARCHIVE"] = str(archive)
+        result = self.pve.cli("tool-update")
+        self.assertIn("已下载最新管理工具", result.stdout)
+        self.assertEqual(self.rows(), rows)
+        self.assertEqual((self.pve.state_dir / "baseline/files.tsv").read_bytes(), baseline)
+        settings = self.pve.shell('printf "%s/%s/%s\\n" "$(config_get TIMEOUT)" "$(config_get BATTERYLEVEL)" "$(config_get MINUTES)"').stdout.strip()
+        self.assertEqual(settings, "900/30/3")
+        self.assertEqual(len([call for call in self.pve.calls() if call[0] == "curl"]), 1)
 
 
 if __name__ == "__main__":

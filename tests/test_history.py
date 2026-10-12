@@ -128,6 +128,22 @@ class HistoryTests(unittest.TestCase):
             self.engine.sync(details)
         self.assertEqual(len(self.rows()), 1)
 
+    def test_same_second_daemon_startups_cannot_merge_snapshot_identity(self):
+        # STARTTIME 只有秒精度，两次启动相同时间并不构成同一 daemon 身份。
+        self.engine.sync(raw_snapshot("ONLINE", stamp(1), stamp(2), "Low line voltage", 1, stamp(0)))
+        original = self.rows()[0]["id"]
+        self.startup()
+        self.startup()
+        self.pve.write_log([(stamp(3), "Power failure."), (stamp(4), "Power is back. UPS running on mains.")], append=True)
+        self.engine.sync(raw_snapshot("ONLINE", stamp(3), stamp(4), "High line voltage", 1, stamp(0)))
+        result = self.query()
+        self.assertEqual(result["summary"]["count"], 1)
+        self.assertEqual(result["summary"]["unassociated"], 1)
+        self.assertNotEqual(result["rows"][0]["id"], original)
+        self.assertFalse(result["rows"][0]["reason_raw"])
+        self.assertEqual(result["pending"][0]["id"], original)
+        self.assertEqual(result["pending"][0]["reason_raw"], "Low line voltage")
+
     def test_log_snapshot_time_skew_uses_daemon_counter_identity(self):
         self.startup()
         for seconds, message in ((10, "Power failure."), (11, "Running on UPS batteries."), (16, "Mains returned. No longer on UPS batteries."), (16, "Power is back. UPS running on mains.")):
@@ -138,6 +154,68 @@ class HistoryTests(unittest.TestCase):
         row = self.rows()[0]
         self.assertEqual(row["reason_raw"], "Low line voltage")
         self.assertEqual(row["duration"], 6)
+
+    def test_later_native_identity_replaces_skewed_snapshot_times_and_keeps_raw_proof(self):
+        original = raw_snapshot("ONLINE", stamp(13), stamp(19), "Low line voltage", 1, stamp(0))
+        self.engine.sync(original)
+        self.assertEqual(self.rows()[0]["origin"], "snapshot")
+        self.pve.write_log([(stamp(0), "apcupsd 3.14.14 (31 May 2016) debian startup succeeded"), (stamp(10), "Power failure."), (stamp(16), "Power is back. UPS running on mains.")])
+        self.engine.sync()
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["origin"], "log")
+        self.assertEqual(row["start_ns"], nanos(10))
+        self.assertEqual(row["end_ns"], nanos(16))
+        self.assertEqual(row["duration"], 6)
+        self.assertEqual(row["reason_raw"], "Low line voltage")
+        saved = self.engine.db.execute("SELECT raw,cycle FROM snapshots").fetchall()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(json.loads(saved[0]["raw"]), self.module.snapshot_fields(original))
+        self.assertEqual(saved[0]["cycle"], row["id"])
+
+    def test_uncertain_log_prefix_invalidates_counter_reason_association(self):
+        initial = [(stamp(1), "Power failure."), (stamp(2), "Power is back. UPS running on mains.")]
+        self.startup()
+        self.pve.write_log(initial, append=True)
+        self.engine.sync(raw_snapshot("ONLINE", stamp(1), stamp(2), "Low line voltage", 1, stamp(0)))
+        self.pve.write_log(initial)
+        self.engine.sync()
+        self.pve.log.rename(self.pve.log.with_name("apcupsd.events.1"))
+        self.pve.write_log(initial)
+        self.pve.write_log([(stamp(3), "Power failure."), (stamp(4), "Power is back. UPS running on mains.")], append=True)
+        latest = raw_snapshot("ONLINE", stamp(3), stamp(4), "High line voltage", 2, stamp(0))
+        self.engine.sync(latest)
+        result = self.query()
+        rows = sorted(result["rows"], key=lambda row: row["start_ns"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["reason_raw"], "Low line voltage")
+        self.assertEqual(rows[1]["reason_cn"], "原因未记录")
+        self.assertFalse(rows[1]["reason_raw"])
+        self.assertIsNone(rows[1]["transfer"], "不确定前缀之后不能假定会话转移序号")
+        self.assertEqual(result["summary"]["unassociated"], 1)
+        self.assertFalse(any(row["reason_raw"] == "High line voltage" for row in rows + result["pending"]))
+        self.assertFalse(self.engine._json("log_state")["known"])
+        saved = self.engine.db.execute("SELECT raw,cycle FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(json.loads(saved["raw"]), self.module.snapshot_fields(latest))
+        self.assertIsNone(saved["cycle"], "最新设备原文须保存但不得硬关联到错误事件")
+
+    def test_unmatched_strong_snapshot_counter_does_not_confirm_old_active_cycle(self):
+        self.startup()
+        self.pve.write_log([(stamp(1), "Power failure.")], append=True)
+        self.engine.sync(raw_snapshot("ONBATT", stamp(1), reason="Low line voltage", counter=1, daemon_start=stamp(0)))
+        self.assertEqual(self.query()["summary"]["current"], 1)
+        latest = raw_snapshot("ONBATT", stamp(2), reason="High line voltage", counter=2, daemon_start=stamp(0))
+        self.engine.sync(latest)
+        result = self.query()
+        self.assertEqual(result["summary"]["count"], 1)
+        self.assertEqual(result["summary"]["current"], 0)
+        self.assertEqual(result["summary"]["unknown"], 1)
+        self.assertEqual(result["rows"][0]["state"], "unknown")
+        self.assertEqual(result["rows"][0]["reason_raw"], "Low line voltage")
+        saved = self.engine.db.execute("SELECT raw,cycle FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(json.loads(saved["raw"]), self.module.snapshot_fields(latest))
+        self.assertIsNone(saved["cycle"])
 
     def test_same_second_distinct_switches_preserved_with_event_identity(self):
         self.startup()
@@ -264,6 +342,35 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual({(row["duration"], row["reason_raw"]) for row in rows}, {(0, "Low line voltage"), (2, "High line voltage")})
         self.assertEqual(legacy.read_text(), original)
 
+    def test_schema1_claimed_hooks_stay_cleared_after_database_upgrade(self):
+        # 固定fixture由 git show 116ccdd:lib/history_store.py 的旧Engine实跑导出，
+        # 正式测试不依赖当前HEAD、Git历史、网络或真实系统服务。
+        self.engine.close()
+        database = self.pve.state_dir / "history.db"
+        database.unlink()
+        fixture = REPO / "tests/fixtures/history-schema1-cleared.sql"
+        with sqlite3.connect(database) as connection:
+            connection.executescript(fixture.read_text())
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM claims").fetchone()[0], 2)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM hooks WHERE suppressed=0").fetchone()[0], 2)
+        connection.close()
+        self.engine = self.module.Engine(str(self.pve.state_dir), str(self.pve.log))
+        self.addCleanup(self.engine.close)
+        self.engine.sync()
+        result = self.query()
+        self.assertEqual(result["rows"], [])
+        self.assertEqual(result["pending"], [])
+        self.assertEqual(self.engine.db.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(self.engine.db.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], 3)
+        self.assertEqual(self.engine.db.execute("SELECT COUNT(*) FROM hooks WHERE suppressed=1").fetchone()[0], 2)
+        self.assertIn("schema1-start", self.engine.diagnostics())
+        self.assertIn("schema1-end", self.engine.diagnostics())
+        self.emit("powerout", 20)
+        self.emit("mainsback", 21)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.rows()[0]["duration"], 1)
+
     def test_clear_prevents_old_log_and_delayed_old_hooks_reimport(self):
         self.startup()
         self.cycle()
@@ -284,6 +391,18 @@ class HistoryTests(unittest.TestCase):
         self.emit("powerout", 10, extra=400)
         self.emit("mainsback", 10, extra=500)
         self.assertEqual(len(self.rows()), 1)
+
+    def test_clear_same_kernel_tick_keeps_later_process_identities(self):
+        with patch.object(self.module, "boot_clock", return_value=("fixture-boot", 100.0)):
+            self.engine.clear(captured_ns=nanos(10), captured_uptime=100.0,
+                              boot_id="fixture-boot", clear_pid=100, clear_birth=10000)
+            # 三个事件的出生 tick / uptime 相同，只有独立进程身份能区分边界。
+            self.engine.capture("powerout", nanos(10), "fixture-boot:99:10000:powerout", captured_uptime=100.0, boot_id="fixture-boot")
+            self.engine.capture("powerout", nanos(10, 100), "fixture-boot:101:10000:powerout", captured_uptime=100.0, boot_id="fixture-boot")
+            self.engine.capture("mainsback", nanos(10, 200), "fixture-boot:102:10000:mainsback", captured_uptime=100.0, boot_id="fixture-boot")
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.rows()[0]["state"], "restored")
+        self.assertEqual(self.engine.db.execute("SELECT COUNT(*) FROM hooks").fetchone()[0], 3)
 
     def test_clear_and_new_capture_concurrently_preserve_post_clear_event(self):
         self.emit("powerout", 1)
@@ -337,6 +456,45 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(self.rows()), 1)
         self.cycle(10, 3, "High line voltage", 2)
         self.assertEqual(len(self.rows()), 2)
+
+    def test_same_second_identical_active_log_inode_keeps_distinct_raw_evidence(self):
+        self.pve.write_log([(stamp(10), "apcupsd 3.14.14 (31 May 2016) debian startup succeeded"), (stamp(10), "Power failure."), (stamp(10), "Power is back. UPS running on mains.")])
+        self.engine.sync()
+        original = self.pve.log.read_bytes()
+        original_inode = self.pve.log.stat().st_ino
+        self.pve.log.rename(self.pve.log.with_name("apcupsd.events.1"))
+        self.pve.log.write_bytes(original)
+        self.assertNotEqual(self.pve.log.stat().st_ino, original_inode)
+        self.engine.sync()
+        result = self.query()
+        self.assertEqual(result["summary"]["count"], 1)
+        self.assertEqual(result["summary"]["unassociated"], 1)
+        self.assertEqual(len(result["pending"]), 1)
+        self.assertEqual(result["pending"][0]["origin"], "log")
+        self.assertFalse(result["pending"][0]["reason_raw"])
+        self.assertEqual(self.engine.db.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], 6)
+        self.assertEqual(self.engine.db.execute("SELECT COUNT(DISTINCT source) FROM evidence").fetchone()[0], 2)
+        self.assertIn(result["pending"][0]["id"], self.engine.diagnostics())
+
+    def test_real_token_birth_ticks_take_priority_over_late_entry_uptime(self):
+        ticks = os.sysconf("SC_CLK_TCK")
+        tokens = {"powerout": f"fixture-boot:101:{ticks}:powerout", "onbattery": f"fixture-boot:102:{ticks + 1}:onbattery", "mainsback": f"fixture-boot:103:{ticks * 2}:mainsback"}
+        with patch.object(self.module, "boot_clock", return_value=("fixture-boot", 50.0)), patch.object(self.module.time, "time_ns", return_value=nanos(50)):
+            # 先执行出生稍晚的onbattery/end worker；powerout出生更早却晚获调度。
+            for event, uptime in (("onbattery", 1 + 1 / ticks), ("mainsback", 2.0), ("powerout", 10.0)):
+                self.engine.capture(event, token=tokens[event], session="fixture-boot:42:50", captured_uptime=uptime, boot_id="fixture-boot")
+        result = self.query()
+        self.assertEqual(result["summary"]["count"], 1)
+        self.assertEqual(result["summary"]["unassociated"], 0)
+        row = result["rows"][0]
+        self.assertEqual(row["id"], "hook:" + tokens["powerout"])
+        self.assertEqual(row["start_ns"], nanos(1))
+        self.assertEqual(row["end_ns"], nanos(2))
+        self.assertEqual(row["duration"], 1)
+        self.assertEqual(self.engine.db.execute("SELECT COUNT(*) FROM hooks").fetchone()[0], 3)
+        self.assertEqual(self.engine.db.execute("SELECT COUNT(*) FROM hook_members WHERE cycle=?", (row["id"],)).fetchone()[0], 3)
+        for token in tokens.values():
+            self.assertIn(token, self.engine.diagnostics())
 
     def test_clear_rotation_restart_timezone_old_rows_stay_cleared(self):
         self.startup()
@@ -414,6 +572,93 @@ class HistoryTests(unittest.TestCase):
         rows = self.rows()
         self.assertEqual(len(rows), 2)
         self.assertEqual(sorted(row["duration"] for row in rows), [1, 1])
+
+    def test_runtime_unclaimed_old_log_does_not_consume_later_callbacks(self):
+        self.startup()
+        self.engine.sync()
+        self.pve.write_log([(stamp(1), "Power failure."), (stamp(2), "Power is back. UPS running on mains.")], append=True)
+        self.engine.sync()
+        self.emit("powerout", 20)
+        self.emit("mainsback", 21)
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sorted(row["duration"] for row in rows), [1, 1])
+        self.assertEqual(self.query()["summary"]["unassociated"], 0)
+
+    def test_log_unavailable_callback_and_snapshot_do_not_double_count(self):
+        self.emit("powerout", 10)
+        self.emit("mainsback", 15)
+        details = raw_snapshot("ONLINE", stamp(13), stamp(18), "Low line voltage", 1, stamp(0))
+        self.engine.sync(details)
+        result = self.query()
+        self.assertEqual(result["summary"]["count"], 1)
+        self.assertEqual(result["summary"]["unassociated"], 1)
+        self.assertEqual(result["rows"][0]["reason_raw"], "Low line voltage")
+        # 无唯一身份时不硬把偏移时间当成同一事件，原始回调仍可完整核查。
+        self.assertEqual(self.engine.db.execute("SELECT COUNT(*) FROM hooks").fetchone()[0], 2)
+        self.assertIn("fixture-event-1", self.engine.diagnostics())
+
+    def test_same_second_delayed_old_log_cannot_reappear_after_clear(self):
+        self.emit("powerout", 10, extra=100)
+        self.emit("mainsback", 10, extra=200)
+        self.engine.clear(captured_ns=nanos(10, 300))
+        # 秒精度日志晚到不能证明它发生在清空之后，不得复活旧记录。
+        self.pve.write_log([(stamp(10), "Power failure."), (stamp(10), "Power is back. UPS running on mains.")])
+        self.engine.sync()
+        self.assertEqual(self.rows(), [])
+        self.emit("powerout", 10, extra=400)
+        self.emit("mainsback", 10, extra=500)
+        self.assertEqual(len(self.rows()), 1, "有独立回调身份证据的同秒新事件必须保留")
+
+    def test_late_offbattery_corrects_previous_later_mainsback_time(self):
+        self.emit("powerout", 1)
+        self.emit("mainsback", 4)
+        self.emit("offbattery", 2)
+        row = self.rows()[0]
+        self.assertEqual(row["end_ns"], nanos(2))
+        self.assertEqual(row["duration"], 1)
+        self.assertEqual(row["state"], "restored")
+
+    def test_unrelated_later_log_after_restart_does_not_hide_hook_history(self):
+        self.startup()
+        self.engine.sync()
+        self.emit("powerout", 1)
+        self.emit("mainsback", 2)
+        self.assertEqual(len(self.rows()), 1)
+        self.startup(9)
+        self.pve.write_log([(stamp(10), "Power failure."), (stamp(12), "Power is back. UPS running on mains.")], append=True)
+        self.engine.sync()
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sorted(row["duration"] for row in rows), [1, 2])
+        self.assertEqual(self.query()["summary"]["unassociated"], 0)
+
+    def test_empty_snapshot_invalidates_previous_current_supply_confirmation(self):
+        self.startup()
+        self.emit("powerout", 1, "Power failure.", raw_snapshot("ONBATT", stamp(1), reason="Low line voltage", counter=1, daemon_start=stamp(0)))
+        self.assertEqual(self.query()["summary"]["current"], 1)
+        self.engine.sync("")
+        result = self.query()
+        self.assertEqual(result["summary"]["current"], 0)
+        self.assertEqual(result["summary"]["unknown"], 1)
+
+    def test_native_unknown_restore_cannot_prove_later_callback_is_independent(self):
+        self.startup()
+        self.pve.write_log([(stamp(1), "Power failure.")], append=True)
+        self.engine.sync()
+        self.emit("powerout", 2)
+        self.emit("mainsback", 3)
+        result = self.query()
+        self.assertEqual(result["summary"]["count"], 1)
+        self.assertEqual(result["summary"]["unknown"], 1)
+        self.assertEqual(result["summary"]["total_seconds"], 0)
+        self.assertEqual(result["summary"]["unassociated"], 1)
+        self.assertEqual(result["rows"][0]["state"], "unknown")
+        self.assertIsNone(result["rows"][0]["end_ns"])
+        self.assertEqual(result["pending"][0]["origin"], "hook")
+        self.assertEqual(result["pending"][0]["duration"], 1)
+        self.assertFalse(result["pending"][0]["reason_raw"])
+        self.assertEqual(self.engine.db.execute("SELECT COUNT(*) FROM hooks").fetchone()[0], 2)
 
     def test_unchanged_sync_does_not_write_history_database(self):
         self.startup()
@@ -573,6 +818,28 @@ class HistoryTests(unittest.TestCase):
         self.engine.sync()
         self.assertLessEqual(self.engine.lines_parsed - parsed_before, 2)
         self.assertEqual(len(self.rows()), 1001)
+
+    def test_snapshot_change_with_three_thousand_native_and_hook_rows_stays_responsive(self):
+        self.engine.sync(raw_snapshot("ONLINE"))
+        records = []
+        for index in range(3000):
+            native_start = index * 4
+            hook_start = native_start if index % 2 == 0 else native_start + 2
+            for origin, start in (("log", native_start), ("hook", hook_start)):
+                records.append((f"fixture-{origin}-{index}", stamp(start), nanos(start), stamp(start + 1), nanos(start + 1), 1, "", "原因未记录", "fixture-session", index + 1, "fixture-source", origin, 1))
+        # 直接装载大量有效投影，避免把成千次逐事件写盘的准备时间算进刷新。
+        with self.engine._transaction():
+            self.engine.db.executemany("INSERT INTO cycles VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", records)
+        started = time.monotonic()
+        self.engine.sync(raw_snapshot("ONLINE", reason="UNKNOWN EVENT"))
+        result = self.engine.query(page=1, size=3)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result["summary"]["count"], 4500)
+        self.assertEqual(result["summary"]["unassociated"], 1500)
+        self.assertEqual(result["summary"]["total_seconds"], 4500)
+        self.assertEqual(len(result["pending"]), 3)
+        self.assertEqual(len(result["rows"]), 3)
+        self.assertLess(elapsed, 2, "六千条投影且snapshot变化时，分类与分页应在2秒内完成")
 
     def test_write_interrupted_by_sigkill_rolls_back_and_can_continue(self):
         self.startup()

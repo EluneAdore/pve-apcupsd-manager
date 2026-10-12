@@ -18,10 +18,10 @@ class IsolatedPVE:
         self.root = Path(self.temporary.name)
         self.bin = self.root / "fake-bin"
         self.bin.mkdir()
-        for name in ("apt-get", "apt-mark", "apt-cache", "dpkg-query", "systemctl", "apcaccess", "logger", "journalctl", "shutdown", "poweroff", "reboot", "halt", "killpower"):
+        for name in ("apt-get", "apt-mark", "apt-cache", "dpkg-query", "systemctl", "apcaccess", "logger", "journalctl", "curl", "shutdown", "poweroff", "reboot", "halt", "killpower"):
             (self.bin / name).symlink_to(TESTS / "fake_system.py")
         self.env = os.environ.copy()
-        for name in ("STATE_DIR", "CONFIG_FILE", "DEFAULTS_FILE", "INSTALL_DIR", "COMMAND_PATH", "HISTORY_FILE", "POLICY_FILE", "APT_LOG_DIR", "PYTHONPATH"):
+        for name in ("STATE_DIR", "CONFIG_FILE", "DEFAULTS_FILE", "INSTALL_DIR", "COMMAND_PATH", "HISTORY_FILE", "POLICY_FILE", "APT_LOG_DIR", "PYTHONPATH", "PVE_UPS_TEST_FAILPOINT", "PVE_UPS_TEST_ARCHIVE", "PVE_UPS_BOOTSTRAP_SOURCE_ONLY"):
             self.env.pop(name, None)
         self.env.update(PVE_UPS_TESTING="1", PVE_UPS_TEST_ROOT=str(self.root), APP_ROOT=str(REPO), PATH=str(self.bin) + ":" + os.environ["PATH"], LC_ALL="C.UTF-8", PYTHONDONTWRITEBYTECODE="1")
         self.state = self.root / "fake-system.json"

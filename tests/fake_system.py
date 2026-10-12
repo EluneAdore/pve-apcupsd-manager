@@ -19,6 +19,17 @@ def main():
         output.write(json.dumps([command, *args]) + "\n")
     if command in {"shutdown", "poweroff", "reboot", "halt", "killpower"}:
         raise SystemExit("测试禁止真实电源操作")
+    if command == "curl":
+        # 下载只能来自当前测试预先构造的归档，绝不访问真实网络。
+        import shutil
+        archive = Path(os.environ.get("PVE_UPS_TEST_ARCHIVE", "/does-not-exist"))
+        if not archive.is_file() or root not in archive.resolve().parents or "-o" not in args:
+            raise SystemExit("测试未提供隔离下载归档，已阻止网络访问")
+        destination = Path(args[args.index("-o") + 1])
+        if not destination.is_absolute() or not str(destination).startswith("/tmp/pve-ups-download."):
+            raise SystemExit("拒绝写入隔离下载目录之外")
+        shutil.copyfile(archive, destination)
+        return 0
     if command == "systemctl":
         operation = args[0]
         if any(a not in {"--quiet", "--runtime", "apcupsd.service"} for a in args[1:]):
