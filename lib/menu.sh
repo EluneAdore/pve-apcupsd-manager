@@ -194,10 +194,27 @@ menu_terminal_restore() {
 }
 
 menu_draw() {
-    local renderer=$1 frame line output=$'\033[H'
+    local renderer=$1 frame body line output=$'\033[H' rows=24 columns=80 occupied
     frame=$("$renderer") || return 1
+    body=$frame
     frame+=$'\n\n请选择（输入数字并回车）：'
     frame+="$MENU_INPUT"
+    if [[ $renderer == render_main_menu ]]; then
+        IFS=' ' read -r rows columns < <(stty size 2>/dev/null) || { rows=24; columns=80; }
+        [[ $rows =~ ^[0-9]+$ && $rows -gt 0 ]] || rows=24
+        [[ $columns =~ ^[0-9]+$ && $columns -gt 0 ]] || columns=80
+        occupied=$(timeout --foreground --kill-after=0.1s 0.3s python3 -B \
+            "$APP_ROOT/lib/hardware.py" --frame-rows "$columns" <<< "$frame" 2>/dev/null) || occupied=$rows
+        [[ $occupied =~ ^[0-9]+$ ]] || occupied=$rows
+        if (( occupied >= rows )); then
+            # 完整快照进入终端滚动缓冲，不截断磁盘；恢复普通输入避免无限重绘。
+            MENU_SCROLL_MODE=1
+            printf '%s\n' "$body"
+            printf '\n终端高度不足：以上为本次完整快照，自动重绘暂停；回车刷新或输入菜单数字。\n'
+            printf '请选择（输入数字并回车）：%s' "$MENU_INPUT"
+            return 0
+        fi
+    fi
     [[ $frame != "$MENU_LAST_FRAME" ]] || return 0
     while IFS= read -r line; do output+=$'\033[K'; output+="$line"; output+=$'\n'; done <<< "$frame"
     # 一次输出整页，不清屏；抹去缩短页面后留下的旧行，并回到输入行。
@@ -208,6 +225,7 @@ menu_draw() {
 menu_choice() {
     local renderer=$1 character deadline remaining remaining_us result escape count
     local cadence=${2:-completion}
+    local MENU_SCROLL_MODE=0
     MENU_CHOICE=''
     MENU_INPUT=''; MENU_LAST_FRAME=''
     if [[ ${TERM:-dumb} == dumb ]]; then
@@ -220,6 +238,11 @@ menu_choice() {
     stty -echo -icanon min 1 time 0 || { menu_terminal_restore; return 1; }
     deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
     menu_draw "$renderer" || { menu_terminal_restore; return 1; }
+    if [[ $MENU_SCROLL_MODE == 1 ]]; then
+        menu_terminal_restore
+        IFS= read -r MENU_CHOICE
+        return
+    fi
     if [[ $cadence != start ]] || (( deadline <= ${EPOCHREALTIME/./} )); then
         deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
     fi
@@ -228,6 +251,12 @@ menu_choice() {
         if (( remaining_us <= 0 )); then
             deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
             menu_draw "$renderer" || { menu_terminal_restore; return 1; }
+            if [[ $MENU_SCROLL_MODE == 1 ]]; then
+                menu_terminal_restore
+                IFS= read -r character || return 1
+                MENU_CHOICE=$MENU_INPUT$character
+                return 0
+            fi
             if [[ $cadence != start ]] || (( deadline <= ${EPOCHREALTIME/./} )); then
                 deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
             fi
@@ -427,8 +456,13 @@ render_diagnosis() {
 }
 
 render_main_menu() {
+    local started=${EPOCHREALTIME/./} elapsed
     render_status
-    printf '\n1. 查看 UPS 详细状态\n2. 查看停电与供电记录\n3. 修改关机设置\n4. 安装 / 修复 apcupsd\n5. 升级 apcupsd\n6. 管理监控服务\n7. 查看事件记录与诊断\n8. 更新管理工具\n9. 卸载并恢复原状态\n10. 查看宿主机硬件状态\n0. 退出\n'
+    elapsed=$(( ${EPOCHREALTIME/./}-started ))
+    printf '\n'
+    if (( elapsed >= 2500000 )); then render_hardware quick || :
+    else render_hardware || :; fi
+    printf '\n1. 查看 UPS 详细状态\n2. 查看停电与供电记录\n3. 修改关机设置\n4. 安装 / 修复 apcupsd\n5. 升级 apcupsd\n6. 管理监控服务\n7. 查看事件记录与诊断\n8. 更新管理工具\n9. 卸载并恢复原状态\n0. 退出\n'
 }
 
 main_menu() {
@@ -440,7 +474,7 @@ main_menu() {
     trap 'exit 129' HUP
     menu_clear
     while :; do
-        menu_choice render_main_menu || return 0
+        menu_choice render_main_menu start || return 0
         case $MENU_CHOICE in
             '') continue ;; 0) return ;;
             1) details_menu; continue ;;
@@ -452,7 +486,6 @@ main_menu() {
             7) render_diagnosis ;;
             8) mutate lifecycle_tool_update ;;
             9) if confirm_uninstall && mutate lifecycle_uninstall; then return; fi ;;
-            10) hardware_menu; continue ;;
             *) msg '请输入菜单中的数字。' ;;
         esac
         menu_pause

@@ -13,7 +13,7 @@ show_help() {
 PVE UPS 管理（本机 APC USB / apcupsd）
   pve-ups                         打开中文菜单
   pve-ups status                  查看当前状态与关机计时
-  pve-ups hardware                按需查看宿主机硬件状态
+  pve-ups hardware                一次性查看 CPU、内存与实体磁盘温度
   pve-ups history                 查看停电与供电历史记录
   pve-ups history --json          查看完整事件身份和来源证据
   pve-ups install                 安装或修复，保留已有参数
