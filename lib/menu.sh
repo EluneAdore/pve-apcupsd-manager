@@ -194,26 +194,35 @@ menu_terminal_restore() {
 }
 
 menu_draw() {
-    local renderer=$1 frame body line output=$'\033[H' rows=24 columns=80 occupied
+    local renderer=$1 frame body line output=$'\033[H' rows=24 columns=80 occupied prompt='请选择（输入数字并回车）：'
+    if [[ $renderer == render_main_menu ]]; then
+        # 记录采集开始时的尺寸；采集中再次缩放会在下一次尺寸检查时重排。
+        MENU_DRAW_SIZE=$(stty size 2>/dev/null) || MENU_DRAW_SIZE='24 80'
+        prompt='请选择：'
+    fi
     frame=$("$renderer") || return 1
     body=$frame
-    frame+=$'\n\n请选择（输入数字并回车）：'
+    if [[ $renderer == render_main_menu ]]; then frame+=$'\n'
+    else frame+=$'\n\n'; fi
+    frame+="$prompt"
     frame+="$MENU_INPUT"
     if [[ $renderer == render_main_menu ]]; then
         IFS=' ' read -r rows columns < <(stty size 2>/dev/null) || { rows=24; columns=80; }
         [[ $rows =~ ^[0-9]+$ && $rows -gt 0 ]] || rows=24
         [[ $columns =~ ^[0-9]+$ && $columns -gt 0 ]] || columns=80
         occupied=$(timeout --foreground --kill-after=0.1s 0.3s python3 -B \
-            "$APP_ROOT/lib/hardware.py" --frame-rows "$columns" <<< "$frame" 2>/dev/null) || occupied=$rows
-        [[ $occupied =~ ^[0-9]+$ ]] || occupied=$rows
-        if (( occupied >= rows )); then
-            # 完整快照进入终端滚动缓冲，不截断磁盘；恢复普通输入避免无限重绘。
+            "$APP_ROOT/lib/hardware.py" --frame-rows "$columns" <<< "$frame" 2>/dev/null) || occupied=$((rows+1))
+        [[ $occupied =~ ^[0-9]+$ ]] || occupied=$((rows+1))
+        if (( occupied > rows )); then
+            # 完整快照进入滚动缓冲；保留同一套逐字符编辑，不切换终端输入模式。
             MENU_SCROLL_MODE=1
-            printf '%s\n' "$body"
-            printf '\n终端高度不足：以上为本次完整快照，自动重绘暂停；回车刷新或输入菜单数字。\n'
-            printf '请选择（输入数字并回车）：%s' "$MENU_INPUT"
+            MENU_LAST_FRAME=''
+            printf '\033[H\033[J%s\n' "$body"
+            printf '静态快照：自动刷新已暂停；空回车刷新，放大窗口可恢复。\n'
+            printf '%s%s' "$prompt" "$MENU_INPUT"
             return 0
         fi
+        MENU_SCROLL_MODE=0
     fi
     [[ $frame != "$MENU_LAST_FRAME" ]] || return 0
     while IFS= read -r line; do output+=$'\033[K'; output+="$line"; output+=$'\n'; done <<< "$frame"
@@ -225,12 +234,14 @@ menu_draw() {
 menu_choice() {
     local renderer=$1 character deadline remaining remaining_us result escape count
     local cadence=${2:-completion}
-    local MENU_SCROLL_MODE=0
+    local MENU_SCROLL_MODE=0 MENU_DRAW_SIZE='' terminal_size size_check=0 now redraw
+    local prompt='请选择（输入数字并回车）：'
+    [[ $renderer != render_main_menu ]] || prompt='请选择：'
     MENU_CHOICE=''
     MENU_INPUT=''; MENU_LAST_FRAME=''
     if [[ ${TERM:-dumb} == dumb ]]; then
         "$renderer"
-        printf '\n请选择（输入数字并回车）：'
+        printf '\n%s' "$prompt"
         IFS= read -r MENU_CHOICE
         return
     fi
@@ -238,30 +249,33 @@ menu_choice() {
     stty -echo -icanon min 1 time 0 || { menu_terminal_restore; return 1; }
     deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
     menu_draw "$renderer" || { menu_terminal_restore; return 1; }
-    if [[ $MENU_SCROLL_MODE == 1 ]]; then
-        menu_terminal_restore
-        IFS= read -r MENU_CHOICE
-        return
-    fi
     if [[ $cadence != start ]] || (( deadline <= ${EPOCHREALTIME/./} )); then
         deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
     fi
     while :; do
-        remaining_us=$((deadline-${EPOCHREALTIME/./}))
-        if (( remaining_us <= 0 )); then
-            deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
+        now=${EPOCHREALTIME/./}
+        redraw=0
+        if [[ $renderer == render_main_menu ]] && (( now >= size_check )); then
+            size_check=$((now+1000000))
+            terminal_size=$(stty size 2>/dev/null) || terminal_size=$MENU_DRAW_SIZE
+            [[ $terminal_size == "$MENU_DRAW_SIZE" ]] || redraw=1
+        fi
+        if (( redraw )) || { [[ $MENU_SCROLL_MODE == 0 ]] && (( now >= deadline )); }; then
+            deadline=$((now+5000000))
             menu_draw "$renderer" || { menu_terminal_restore; return 1; }
-            if [[ $MENU_SCROLL_MODE == 1 ]]; then
-                menu_terminal_restore
-                IFS= read -r character || return 1
-                MENU_CHOICE=$MENU_INPUT$character
-                return 0
-            fi
             if [[ $cadence != start ]] || (( deadline <= ${EPOCHREALTIME/./} )); then
                 deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
             fi
             continue
         fi
+        # 静态模式只检查尺寸，不重复采集；尺寸变化或空回车可重新采集并恢复自动刷新。
+        remaining_us=$((deadline-now))
+        if [[ $renderer == render_main_menu ]]; then
+            if [[ $MENU_SCROLL_MODE == 1 ]] || (( remaining_us > size_check-now )); then
+                remaining_us=$((size_check-now))
+            fi
+        fi
+        (( remaining_us > 0 )) || continue
         printf -v remaining '%d.%06d' "$((remaining_us/1000000))" "$((remaining_us%1000000))"
         character=''
         IFS= read -r -N 1 -t "$remaining" character; result=$?
@@ -270,7 +284,8 @@ menu_choice() {
         case $character in
             $'\n'|$'\r') MENU_CHOICE=$MENU_INPUT; menu_terminal_restore; printf '\n'; return 0 ;;
             $'\004')
-                if [[ -z $MENU_INPUT ]]; then menu_terminal_restore; return 1; fi
+                # 主菜单仅 Enter 提交；EOF 退出，不执行未确认的维护选择。
+                if [[ $renderer == render_main_menu || -z $MENU_INPUT ]]; then menu_terminal_restore; return 1; fi
                 MENU_CHOICE=$MENU_INPUT; menu_terminal_restore; printf '\n'; return 0 ;;
             $'\177'|$'\b') MENU_INPUT=${MENU_INPUT%?} ;;
             $'\025') MENU_INPUT='' ;;
@@ -284,7 +299,7 @@ menu_choice() {
             [0-9]) (( ${#MENU_INPUT} >= 8 )) || MENU_INPUT+=$character ;;
             *) continue ;;
         esac
-        printf '\r\033[K请选择（输入数字并回车）：%s' "$MENU_INPUT"
+        printf '\r\033[K%s%s' "$prompt" "$MENU_INPUT"
     done
 }
 
@@ -459,10 +474,9 @@ render_main_menu() {
     local started=${EPOCHREALTIME/./} elapsed
     render_status
     elapsed=$(( ${EPOCHREALTIME/./}-started ))
-    printf '\n'
     if (( elapsed >= 2500000 )); then render_hardware quick || :
     else render_hardware || :; fi
-    printf '\n1. 查看 UPS 详细状态\n2. 查看停电与供电记录\n3. 修改关机设置\n4. 安装 / 修复 apcupsd\n5. 升级 apcupsd\n6. 管理监控服务\n7. 查看事件记录与诊断\n8. 更新管理工具\n9. 卸载并恢复原状态\n0. 退出\n'
+    printf '1. 查看 UPS 详细状态\n2. 查看停电与供电记录\n3. 修改关机设置\n4. 安装 / 修复 apcupsd\n5. 升级 apcupsd\n6. 管理监控服务\n7. 查看事件记录与诊断\n8. 更新管理工具\n9. 卸载并恢复原状态\n0. 退出\n'
 }
 
 main_menu() {

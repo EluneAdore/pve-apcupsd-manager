@@ -396,10 +396,10 @@ def disk_lines(disks, sensors, reader, width):
         values.append(f"{label}：{reading}")
     if not values:
         return ["磁盘温度：无可见实体磁盘"]
-    lines = ["磁盘温度："]
-    row = ""
+    lines = []
+    row = "磁盘温度："
     for value in values:
-        proposed = row + "    " + value if row else value
+        proposed = row + ("" if row == "磁盘温度：" else "    ") + value
         if row and text_width(proposed) > width:
             lines.append(row)
             row = value
@@ -454,9 +454,11 @@ def overview(width=80, sample=True):
         usage = "不可用"
     sensors = hwmon_devices(reader)
     disks = physical_disks(reader)
-    lines = ["──────── PVE 硬件状态 ────────",
-             f"CPU 使用率：{usage}    温度：{cpu_temperature(reader, sensors)}",
-             package_line(domains, first_power, second_power),
+    cpu = f"CPU 使用率：{usage}    温度：{cpu_temperature(reader, sensors)}"
+    power = package_line(domains, first_power, second_power)
+    # 宽度允许时共享一行；多个 Package 或窄终端保留完整内容并分行。
+    cpu_lines = [cpu + "    " + power] if text_width(cpu + "    " + power) <= width else [cpu, power]
+    lines = ["──────── PVE 硬件状态 ────────", *cpu_lines,
              memory_line(reader.read(PROC / "meminfo"))]
     return lines + disk_lines(disks, sensors, reader, width)
 
