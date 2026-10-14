@@ -28,6 +28,40 @@ ups_measurement() {
     printf '%s %s\n' "${BASH_REMATCH[1]}" "$unit"
 }
 
+ups_power_number() {
+    local key=$1 value
+    [[ $UPS_QUERY_OK == 1 ]] || return 1
+    value=$(ups_value "$key")
+    value=${value,,}
+    case $key in
+        NOMPOWER)
+            [[ $value =~ ^([0-9]+([.][0-9]+)?)([[:space:]]+(w|watts))?$ ]] || return 1 ;;
+        LOADPCT)
+            [[ $value =~ ^([0-9]+([.][0-9]+)?)([[:space:]]+(%|percent)([[:space:]]+load[[:space:]]+capacity)?)?$ ]] || return 1 ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+ups_estimated_power() {
+    local nominal load state
+    state=$(ups_value STATUS)
+    if [[ $UPS_QUERY_OK != 1 || -z $state || $state == *COMMLOST* ]]; then
+        msg '无法估算（UPS 通信或状态不可用）'; return
+    fi
+    if ! nominal=$(ups_power_number NOMPOWER) || ! load=$(ups_power_number LOADPCT); then
+        msg '无法估算（额定功率或负载数据缺失／无效）'; return
+    fi
+    # 只读取当前快照；单位必须为 W，不能把 VA 当成有功功率。
+    LC_ALL=C awk -v ups_nominal_watts="$nominal" -v ups_load_pct="$load" 'BEGIN {
+        if (ups_nominal_watts <= 0) { print "无法估算（额定功率无效）"; exit }
+        if (ups_load_pct < 0 || ups_load_pct > 100) { print "无法估算（负载比例异常）"; exit }
+        ups_power_watts = ups_nominal_watts * ups_load_pct / 100
+        if (tolower(sprintf("%g", ups_power_watts)) ~ /inf|nan/) { print "无法估算（功率数据异常）"; exit }
+        printf "%.1f W%s\n", ups_power_watts, ups_load_pct == 0 ? "（低负载精度有限）" : ""
+    }'
+}
+
 ups_has_value() {
     local value
     [[ $UPS_QUERY_OK == 1 ]] || return 1
@@ -59,7 +93,7 @@ render_countdown() {
 }
 
 render_status() {
-    local version monitoring model battery runtime load elapsed
+    local version monitoring model battery runtime load power elapsed
     version=$(package_version) || version=''
     version=${version:-未安装}
     monitoring='已停止'
@@ -75,8 +109,10 @@ render_status() {
     battery=$(ups_measurement BCHARGE '%') || battery=''
     runtime=$(ups_measurement TIMELEFT 'min') || runtime=''
     load=$(ups_measurement LOADPCT '%') || load=''
+    power=$(ups_estimated_power)
     msg "电池电量：$battery    剩余续航：$runtime"
     msg "负载比例：$load"
+    msg "接入设备总负载（估算）：$power"
     if [[ $UPS_QUERY_OK == 1 && " $(ups_value STATUS) " == *' ONBATT '* && $(ups_value STATUS) != *COMMLOST* ]]; then
         elapsed=$(ups_measurement TONBATT 's') || elapsed=''
         msg "本次停电时长：$elapsed"
@@ -90,12 +126,13 @@ render_details() {
     render_status
     msg ''
     msg '──────── 设备详细读数 ────────'
-    for key in UPSNAME SERIALNO LINEV OUTPUTV LINEFREQ ITEMP BATTV NOMBATTV BATTDATE LASTXFER XONBATT XOFFBATT; do
+    for key in UPSNAME SERIALNO LINEV OUTPUTV LINEFREQ ITEMP BATTV NOMBATTV NOMPOWER BATTDATE LASTXFER XONBATT XOFFBATT; do
         case $key in
             UPSNAME) label='设备名称' ;; SERIALNO) label='设备序列号' ;;
             LINEV) label='输入电压' ;; OUTPUTV) label='输出电压' ;;
             LINEFREQ) label='输入频率' ;; ITEMP) label='设备温度' ;;
             BATTV) label='电池电压' ;; NOMBATTV) label='额定电池电压' ;;
+            NOMPOWER) label='额定输出功率' ;;
             BATTDATE) label='设备记录的电池日期' ;; LASTXFER) label='上次切换原因（设备原文）' ;;
             XONBATT) label='上次转入电池时间' ;; XOFFBATT) label='上次恢复市电时间' ;;
         esac
@@ -105,6 +142,8 @@ render_details() {
             LINEV|OUTPUTV|BATTV|NOMBATTV) value=$(ups_measurement "$key" 'V') || value='' ;;
             LINEFREQ) value=$(ups_measurement "$key" 'Hz') || value='' ;;
             ITEMP) value=$(ups_measurement "$key" '°C') || value='' ;;
+            NOMPOWER)
+                if value=$(ups_power_number NOMPOWER); then value+=' W'; else value=''; fi ;;
             LASTXFER)
                 if [[ -n $value ]]; then
                     local translated
@@ -168,6 +207,7 @@ menu_draw() {
 
 menu_choice() {
     local renderer=$1 character deadline remaining remaining_us result escape count
+    local cadence=${2:-completion}
     MENU_CHOICE=''
     MENU_INPUT=''; MENU_LAST_FRAME=''
     if [[ ${TERM:-dumb} == dumb ]]; then
@@ -178,13 +218,20 @@ menu_choice() {
     fi
     MENU_TTY_STATE=$(stty -g) || return 1
     stty -echo -icanon min 1 time 0 || { menu_terminal_restore; return 1; }
-    menu_draw "$renderer" || { menu_terminal_restore; return 1; }
     deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
+    menu_draw "$renderer" || { menu_terminal_restore; return 1; }
+    if [[ $cadence != start ]] || (( deadline <= ${EPOCHREALTIME/./} )); then
+        deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
+    fi
     while :; do
         remaining_us=$((deadline-${EPOCHREALTIME/./}))
         if (( remaining_us <= 0 )); then
+            deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
             menu_draw "$renderer" || { menu_terminal_restore; return 1; }
-            deadline=$(( ${EPOCHREALTIME/./}+5000000 )); continue
+            if [[ $cadence != start ]] || (( deadline <= ${EPOCHREALTIME/./} )); then
+                deadline=$(( ${EPOCHREALTIME/./}+5000000 ))
+            fi
+            continue
         fi
         printf -v remaining '%d.%06d' "$((remaining_us/1000000))" "$((remaining_us%1000000))"
         character=''
@@ -381,7 +428,7 @@ render_diagnosis() {
 
 render_main_menu() {
     render_status
-    printf '\n1. 查看 UPS 详细状态\n2. 查看停电与供电记录\n3. 修改关机设置\n4. 安装 / 修复 apcupsd\n5. 升级 apcupsd\n6. 管理监控服务\n7. 查看事件记录与诊断\n8. 更新管理工具\n9. 卸载并恢复原状态\n0. 退出\n'
+    printf '\n1. 查看 UPS 详细状态\n2. 查看停电与供电记录\n3. 修改关机设置\n4. 安装 / 修复 apcupsd\n5. 升级 apcupsd\n6. 管理监控服务\n7. 查看事件记录与诊断\n8. 更新管理工具\n9. 卸载并恢复原状态\n10. 查看宿主机硬件状态\n0. 退出\n'
 }
 
 main_menu() {
@@ -405,6 +452,7 @@ main_menu() {
             7) render_diagnosis ;;
             8) mutate lifecycle_tool_update ;;
             9) if confirm_uninstall && mutate lifecycle_uninstall; then return; fi ;;
+            10) hardware_menu; continue ;;
             *) msg '请输入菜单中的数字。' ;;
         esac
         menu_pause
