@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """按需读取宿主机硬件状态；不执行设备控制命令，不写入采集数据。"""
 
+import argparse
+import json
 import math
 import os
 from pathlib import Path
@@ -118,7 +120,7 @@ def cpu_information(text):
     return models, len(set(processors)), frequencies
 
 
-def frequency_line(reader, cpuinfo):
+def frequency_line(reader, cpuinfo=None):
     frequencies = []
     try:
         cpus = sorted((SYS / "devices/system/cpu").glob("cpu[0-9]*"))
@@ -134,6 +136,8 @@ def frequency_line(reader, cpuinfo):
             frequencies.append(value / 1000)
     source = "scaling_cur_freq"
     if not frequencies:
+        if cpuinfo is None:
+            cpuinfo = reader.read(PROC / "cpuinfo", 4 * 1024 * 1024)
         frequencies = cpu_information(cpuinfo)[2]
         source = "/proc/cpuinfo cpu MHz"
     if not frequencies:
@@ -162,7 +166,7 @@ def discover_rapl(reader):
     visited = set()
     domains = []
     # class 下可同时出现区域链接与嵌套区域；按真实路径去重。
-    while pending and len(visited) < 256:
+    while pending and len(visited) < 256 and time.monotonic() < reader.deadline:
         path, depth = pending.pop()
         try:
             identity = str(path.resolve())
@@ -343,16 +347,52 @@ def pve_version(reader):
     # 从已安装包的本地元数据读取版本，不访问 PVE API 或执行包管理操作。
     status = reader.read(Path("/var/lib/dpkg/status"), 16 * 1024 * 1024)
     if status:
-        for paragraph in status.split("\n\n"):
+        package = re.search(r"(?m)^Package: pve-manager$", status)
+        if package:
+            ending = status.find("\n\n", package.start())
+            paragraph = status[package.start():ending if ending >= 0 else len(status)]
             fields = dict(line.split(": ", 1) for line in paragraph.splitlines() if ": " in line and not line.startswith(" "))
             if fields.get("Package") == "pve-manager" and fields.get("Status") == "install ok installed":
                 return safe_text(fields.get("Version", "不可用"))
     return "不可用（本地未找到已安装的 pve-manager 元数据）"
 
 
-def system_lines(reader):
-    lines = ["PVE 版本：" + pve_version(reader),
-             "Linux 内核：" + safe_text(reader.read(PROC / "sys/kernel/osrelease") or "不可用")]
+def collect_static(reader):
+    """一次菜单会话只采集一次静态信息，不缓存频率、计数器或传感器。"""
+    models, threads, _ = cpu_information(reader.read(PROC / "cpuinfo", 4 * 1024 * 1024))
+    return {"models": [safe_text(model) for model in models[:64]],
+            "threads": threads if threads <= 1048576 else 0,
+            "pve": pve_version(reader),
+            "kernel": safe_text(reader.read(PROC / "sys/kernel/osrelease") or "不可用")}
+
+
+def validate_static_json(raw):
+    """IPC 内容仅作为数据；拒绝额外字段、异常类型和过大内容。"""
+    if not isinstance(raw, str) or len(raw) > 32768:
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict) or set(value) != {"models", "threads", "pve", "kernel"}:
+        return None
+    models = value["models"]
+    if (not isinstance(models, list) or len(models) > 64
+            or any(not isinstance(model, str) or len(model) > 240
+                   or any(not c.isprintable() for c in model) for model in models)
+            or type(value["threads"]) is not int or not 0 <= value["threads"] <= 1048576):
+        return None
+    for key in ("pve", "kernel"):
+        if (not isinstance(value[key], str) or len(value[key]) > 240
+                or any(not c.isprintable() for c in value[key])):
+            return None
+    return value
+
+
+def system_lines(reader, static=None):
+    if static is None:
+        static = collect_static(reader)
+    lines = ["PVE 版本：" + static["pve"], "Linux 内核：" + static["kernel"]]
     uptime = reader.read(PROC / "uptime")
     try:
         seconds = float(uptime.split()[0])
@@ -376,24 +416,34 @@ def system_lines(reader):
     return lines
 
 
-def main():
-    reader = Reader(time.monotonic() + 4)
-    cpuinfo = reader.read(PROC / "cpuinfo", 4 * 1024 * 1024)
-    models, threads, _ = cpu_information(cpuinfo)
-    domains = discover_rapl(reader)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="只读宿主机硬件采集")
+    parser.add_argument("--static", action="store_true", help="输出当前菜单会话的静态信息 JSON")
+    parser.add_argument("--static-json", help="复用当前菜单会话的静态信息 JSON")
+    args = parser.parse_args(argv)
+    if args.static:
+        print(json.dumps(collect_static(Reader(time.monotonic() + 0.45)), ensure_ascii=False))
+        return 0
+    reader = Reader(time.monotonic() + 1.8)
+    static = validate_static_json(args.static_json)
+    if static is None:
+        static = collect_static(reader)
+    models, threads = static["models"], static["threads"]
+    # 区域发现只占短预算，为两次实时采样保留约一秒。
+    domains = discover_rapl(Reader(min(reader.deadline - 1.1, time.monotonic() + 0.2)))
     started = time.monotonic()
     first_cpu = parse_cpu_stat(reader.read(PROC / "stat"))
     first_power = sample_rapl(domains, reader)
-    first_io = sample_io(reader.read)
+    first_io = sample_io(Reader(min(reader.deadline, time.monotonic() + 0.2)).read)
     first_time = time.monotonic()
-    time.sleep(max(0, 1 - (time.monotonic() - started)))
+    time.sleep(max(0, min(1 - (time.monotonic() - started), reader.deadline - time.monotonic())))
     second_cpu = parse_cpu_stat(reader.read(PROC / "stat"))
     second_power = sample_rapl(domains, reader)
-    second_io = sample_io(reader.read)
+    second_io = sample_io(Reader(min(reader.deadline, time.monotonic() + 0.25)).read)
     elapsed = time.monotonic() - first_time
     lines = ["──────── CPU ────────", "型号：" + (" / ".join(safe_text(model) for model in models) or "不可用"),
              "逻辑处理器：" + (str(threads) if threads else "不可用"),
-             "CPU 总使用率：" + cpu_usage(first_cpu, second_cpu), frequency_line(reader, cpuinfo)]
+             "CPU 总使用率：" + cpu_usage(first_cpu, second_cpu), frequency_line(reader)]
     lines.extend(rapl_lines(domains, first_power, second_power))
     lines.extend(("", "──────── 内存 ────────"))
     lines.extend(memory_lines(reader.read(PROC / "meminfo")))
@@ -401,7 +451,7 @@ def main():
     lines.extend(read_temperature(reader))
     lines.extend(("", *render_io(first_io, second_io, elapsed)))
     lines.extend(("", "──────── 系统 ────────"))
-    lines.extend(system_lines(reader))
+    lines.extend(system_lines(reader, static))
     print("\n".join(lines))
     return 0
 

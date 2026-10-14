@@ -46,13 +46,22 @@ service_active() { systemctl is-active --quiet apcupsd.service 2>/dev/null; }
 read_ups_snapshot() {
     UPS_DATA=''; UPS_QUERY_OK=0
     command -v apcaccess >/dev/null 2>&1 || return 1
-    local port=3551 addr=127.0.0.1
+    local port=3551 addr=127.0.0.1 query_budget=${1:-}
     if [[ -r $CONFIG_FILE ]]; then
         port=$(awk '$1=="NISPORT" {v=$2} END {print v}' "$CONFIG_FILE")
         port=${port:-3551}
     fi
     [[ $port =~ ^[0-9]+$ ]] || return 1
-    UPS_DATA=$(timeout 3 apcaccess status "$addr:$port" 2>/dev/null) || return 1
+    if [[ -n $query_budget ]]; then
+        # 仅按需硬件页面使用短预算；其它调用保持原来的三秒查询路径。
+        [[ $query_budget =~ ^[0-9]+([.][0-9]+)?$ && -n ${query_budget//[0.]/} ]] || return 1
+        if ! UPS_DATA=$(timeout --foreground --signal=TERM --kill-after=0.2s \
+            "$query_budget" apcaccess status "$addr:$port" 2>/dev/null); then
+            UPS_DATA=''; return 1
+        fi
+    else
+        UPS_DATA=$(timeout 3 apcaccess status "$addr:$port" 2>/dev/null) || return 1
+    fi
     [[ -n $UPS_DATA ]] || return 1
     UPS_QUERY_OK=1
 }

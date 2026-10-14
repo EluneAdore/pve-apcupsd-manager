@@ -3,14 +3,18 @@
 
 render_hardware() {
     local report rc battery runtime load
+    local -a collector_args=()
+    if [[ -n ${HARDWARE_STATIC_DATA:-} ]]; then
+        collector_args=(--static-json "$HARDWARE_STATIC_DATA")
+    fi
     msg '──────── 宿主机硬件状态 ────────'
     if ! command -v python3 >/dev/null 2>&1; then
         msg '硬件采集不可用：系统未提供 python3。'
         rc=1
     else
         # 与终端共享前台进程组，Ctrl+C 同时中止采集；超时后强制结束。
-        report=$(timeout --foreground --signal=TERM --kill-after=1s 5s \
-            python3 -B "$APP_ROOT/lib/hardware.py" 2>/dev/null)
+        report=$(timeout --foreground --signal=TERM --kill-after=0.2s 2s \
+            python3 -B "$APP_ROOT/lib/hardware.py" "${collector_args[@]}" 2>/dev/null)
         rc=$?
         if (( rc == 0 )); then
             [[ -z $report ]] || msg "$report"
@@ -21,7 +25,7 @@ render_hardware() {
         fi
     fi
     # 每次页面只查询一次 UPS，功率计算复用同一个快照，不同步历史。
-    read_ups_snapshot || :
+    read_ups_snapshot 1.2 || :
     msg ''
     msg '──────── UPS ────────'
     msg "供电状态：$(ups_status_chinese)"
@@ -58,6 +62,12 @@ render_hardware_menu() {
 
 hardware_menu() {
     local HARDWARE_PAGE_OFFSET=0
+    local HARDWARE_STATIC_DATA
+    # 在父菜单会话内缓存静态 JSON；渲染子进程只读使用，关闭菜单即销毁。
+    HARDWARE_STATIC_DATA=$(timeout --foreground --signal=TERM --kill-after=0.1s 0.5s \
+        python3 -B "$APP_ROOT/lib/hardware.py" --static 2>/dev/null) || HARDWARE_STATIC_DATA=''
+    # 初始化失败不在每次刷新重试，重新打开菜单才再次读取。
+    HARDWARE_STATIC_DATA=${HARDWARE_STATIC_DATA:-'{"models":[],"threads":0,"pve":"不可用","kernel":"不可用"}'}
     while :; do
         # 正常采集时间计入五秒周期；采集超时后仍为输入留出时间。
         menu_choice render_hardware_menu start || return 0
