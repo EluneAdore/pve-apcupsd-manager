@@ -242,8 +242,9 @@ menu_choice() {
     if [[ ${TERM:-dumb} == dumb ]]; then
         "$renderer"
         printf '\n%s' "$prompt"
-        IFS= read -r MENU_CHOICE
-        return
+        IFS= read -r character || return 1
+        MENU_CHOICE=$character
+        return 0
     fi
     MENU_TTY_STATE=$(stty -g) || return 1
     stty -echo -icanon min 1 time 0 || { menu_terminal_restore; return 1; }
@@ -284,9 +285,8 @@ menu_choice() {
         case $character in
             $'\n'|$'\r') MENU_CHOICE=$MENU_INPUT; menu_terminal_restore; printf '\n'; return 0 ;;
             $'\004')
-                # 主菜单仅 Enter 提交；EOF 退出，不执行未确认的维护选择。
-                if [[ $renderer == render_main_menu || -z $MENU_INPUT ]]; then menu_terminal_restore; return 1; fi
-                MENU_CHOICE=$MENU_INPUT; menu_terminal_restore; printf '\n'; return 0 ;;
+                # 所有菜单仅 Enter 提交；Ctrl+D 取消输入，不执行未确认的选择。
+                menu_terminal_restore; return 1 ;;
             $'\177'|$'\b') MENU_INPUT=${MENU_INPUT%?} ;;
             $'\025') MENU_INPUT='' ;;
             $'\033')
